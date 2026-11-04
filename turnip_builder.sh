@@ -66,16 +66,21 @@ prepare_workdir(){
 inject_custom_code(){
 	echo "正在注入自定义 Turnip 流出代码..." $'\n'
 	
-	python3 -c "
+	cat << 'PYEOF' > /tmp/inject.py
+import sys
+
 file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-# 1. 注入头文件 (必须包含 drm/freedreno_bo.h 才能用 fd_bo_map)
-content = content.replace('#include \"tu_cmd_buffer.h\"', '#include \"tu_cmd_buffer.h\"\n#include \"drm/freedreno_bo.h\"\n#include <stdio.h>\n#include <time.h>')
+# 1. 只注入 stdio 和 time，不包含找不到的 drm 头文件
+content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>')
 
-# 2. 注入截获代码 (注意转义字符 \\n)
-hook_code = '''
+# 2. 注入截获代码（直接使用 extern 声明函数，无视头文件缺失）
+hook_code = r'''
+         extern void *fd_bo_map(struct fd_bo *bo);
+         extern void fd_bo_unmap(struct fd_bo *bo);
+
          if (buf && buf->bo) {
             static struct timespec last_time = {0, 0};
             struct timespec now;
@@ -86,7 +91,7 @@ hook_code = '''
                void *map_addr = fd_bo_map(buf->bo);
                if (map_addr) {
                   float *verts = (float *)map_addr;
-                  fprintf(stderr, \"TURNIP_DUMP: %.1f,%.1f,%.1f | %.1f,%.1f,%.1f | %.1f,%.1f,%.1f\\\\n\", 
+                  fprintf(stderr, "TURNIP_DUMP: %.1f,%.1f,%.1f | %.1f,%.1f,%.1f | %.1f,%.1f,%.1f\n", 
                            verts[0], verts[1], verts[2], verts[3], verts[4], verts[5], verts[6], verts[7], verts[8]);
                   fflush(stderr);
                   fd_bo_unmap(buf->bo);
@@ -103,11 +108,13 @@ if target_str in content:
     print('✅ 源码注入成功！')
 else:
     print('❌ 找不到目标函数，可能源码结构变了！')
-    exit(1)
+    sys.exit(1)
 
 with open(file_path, 'w') as f:
     f.write(content)
-"
+PYEOF
+
+	python3 /tmp/inject.py
 }
 # =======================================================
 
