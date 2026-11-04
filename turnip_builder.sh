@@ -1,12 +1,10 @@
-#!/bin/bash
+#!/bin/bash -e
 
-# ==========================================
-# Turnip Vulkan 驱动层 DrawCall 模型矩阵提取 (修复版)
-# ==========================================
-
+#Define variables
 green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
+deps="meson ninja patchelf unzip curl pip flex bison zip"
 workdir="$(pwd)/turnip_workdir"
 magiskdir="$workdir/turnip_module"
 ndkver="android-ndk-r28"
@@ -14,147 +12,217 @@ ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
 sdkver="34"
 mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
 
+clear
+
+#There are 4 functions here, simply comment to disable.
+#You can insert your own function and make a pull request.
 run_all(){
-    check_deps
-    prepare_workdir
-    inject_custom_code
-    build_lib_for_android
-    port_lib_for_magisk
-    port_lib_for_adrenotools
-    echo -e "${green}======================================${nocolor}"
-    echo -e "${green}编译完成！${nocolor}"
-    echo -e "${green}Magisk 模块: $workdir/turnip_magisk.zip${nocolor}"
-    echo -e "${green}AdrenoTools 驱动: $workdir/turnip_adrenotools.zip${nocolor}"
-    echo -e "${green}======================================${nocolor}"
+	check_deps
+	prepare_workdir
+	inject_dump_code       # <--- 注入抓取明文代码
+	build_lib_for_android
+	port_lib_for_magisk
+	port_lib_for_adrenotools
 }
 
 check_deps(){
-    echo -e "${green}[1/6] 检查依赖...${nocolor}"
-    sudo apt-get update -qq
-    sudo apt-get install -y glslang-tools python3-pip zip unzip curl patchelf ccache
-    pip install mako &> /dev/null
+	echo "Checking system for required Dependencies ..."
+		for deps_chk in $deps;
+			do
+				sleep 0.25
+				if command -v "$deps_chk" >/dev/null 2>&1 ; then
+					echo -e "$green - $deps_chk found $nocolor"
+				else
+					echo -e "$red - $deps_chk not found, can't countinue. $nocolor"
+					deps_missing=1
+				fi;
+			done
+
+		if [ "$deps_missing" == "1" ]
+			then echo "Please install missing dependencies" && exit 1
+		fi
+
+	echo "Installing python Mako dependency (if missing) ..." $'\n'
+		pip install mako &> /dev/null
 }
 
 prepare_workdir(){
-    echo -e "${green}[2/6] 准备源码...${nocolor}"
-    mkdir -p "$workdir" && cd "$_"
-    if [ ! -d "$ndkver" ]; then
-        curl -L https://dl.google.com/android/repository/"$ndkver"-linux.zip --output "$ndkver"-linux.zip &> /dev/null
-        unzip -q "$ndkver"-linux.zip &> /dev/null
-    fi
-    if [ ! -d "mesa-main" ]; then
-        curl -L "$mesasrc" --output mesa-main.zip &> /dev/null
-        unzip -q mesa-main.zip &> /dev/null
-    fi
+	echo "Preparing work directory ..." $'\n'
+		mkdir -p "$workdir" && cd "$_"
+
+	echo "Downloading android-ndk from google server ..." $'\n'
+		curl https://dl.google.com/android/repository/"$ndkver"-linux.zip --output "$ndkver"-linux.zip &> /dev/null
+	echo "Exracting android-ndk ..." $'\n'
+		unzip "$ndkver"-linux.zip &> /dev/null
+
+	echo "Downloading mesa source ..." $'\n'
+		curl "$mesasrc" --output mesa-main.zip &> /dev/null
+	echo "Exracting mesa source ..." $'\n'
+		unzip mesa-main.zip &> /dev/null
+		cd mesa-main
 }
 
-# ================= 核心：在绘制时抓取模型矩阵 =================
-inject_custom_code(){
-    echo -e "${green}[3/6] 注入 DrawCall 模型提取代码...${nocolor}"
-    
-    cat << 'PYEOF' > /tmp/inject.py
+inject_dump_code(){
+	echo "Injecting DUMP code into tu_cmd_buffer.cc ..." $'\n'
+	cd "$workdir/mesa-main/src/freedreno/vulkan"
+	
+	# 使用 Python 脚本进行精准文本替换，防呆设计，找不到锚点直接报错
+	python3 - <<'PYEOF'
 import sys
 
-file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
-with open(file_path, 'r') as f:
+file_path = "tu_cmd_buffer.cc"
+with open(file_path, "r", encoding="utf-8") as f:
     content = f.read()
 
-# 补齐头文件
-if '#include <math.h>' not in content:
-    content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <math.h>')
+def safe_replace(content, anchor, code, name):
+    if anchor not in content:
+        print(f"ERROR: Could not find anchor for {name}!")
+        print(f"Expected anchor: {anchor}")
+        sys.exit(1)
+    return content.replace(anchor, code + "\n" + anchor, 1)
 
-# ================= 拦截 tu_CmdDrawIndexed =================
-draw_hook_code = r'''
-   // ======== 提取 DrawCall 时的模型矩阵 ========
-   static long last_draw_sec = 0;
-   struct timespec now_draw;
-   clock_gettime(CLOCK_MONOTONIC, &now_draw);
-   
-   // 限制频率：1秒抓一次，只抓大模型（过滤掉UI和简单特效）
-   if (now_draw.tv_sec != last_draw_sec && indexCount > 1000) {
-       last_draw_sec = now_draw.tv_sec;
-       
-       FILE *fp = fopen("/sdcard/ue4_models.txt", "a");
-       if (fp) {
-           fprintf(fp, "\n[DrawIndexed] IndexCount: %u | InstanceCount: %u\n", indexCount, instanceCount);
-           
-           // 获取当前绑定的描述符集 (存放模型矩阵的地方)
-           struct tu_descriptor_state *desc_state = tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
-           
-           for (uint32_t s = 0; s < desc_state->max_sets_bound; s++) {
-               struct tu_descriptor_set *set = desc_state->sets[s];
-               if (!set) continue;
-               
-               for (uint32_t b = 0; b < set->layout->binding_count; b++) {
-                   struct tu_descriptor_set_binding_layout *binding = &set->layout->binding[b];
-                   
-                   // 找 UBO 或 SSBO
-                   if (binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || 
-                       binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-                       
-                       // 如果这块内存 CPU 可读，直接暴力提取
-                       if (set->mapped_ptr) {
-                           float *data = (float *)((char*)set->mapped_ptr + binding->offset);
-                           
-                           fprintf(fp, "  Set[%u] Bind[%u] Data:\n", s, b);
-                           // 打印前 16 个 float (一个 4x4 矩阵)
-                           for (int k = 0; k < 16; k++) {
-                               if (isfinite(data[k]) && fabs(data[k]) < 100000.0f) {
-                                   fprintf(fp, "%8.2f ", data[k]);
-                               } else {
-                                   fprintf(fp, " [BUF]  ");
-                               }
-                               if ((k + 1) % 4 == 0) fprintf(fp, "\n");
-                           }
-                       }
-                   }
-               }
-           }
-           fclose(fp);
+# 1. 注入全局变量和结构体
+header_code = """
+#include <stdio.h>
+#include <stdlib.h>
+
+static uint8_t* g_vbo_mapped_ptrs[MAX_VBS] = {0};
+static FILE* g_dump_file = NULL;
+static uint32_t g_draw_count = 0;
+#define MAX_DUMP_DRAWS 5000 
+
+struct DumpHeader {
+    uint32_t magic;         // 'TUDP'
+    uint32_t draw_type;     // 0: Draw, 1: DrawIndexed
+    uint32_t vertex_count;
+    uint32_t instance_count;
+    uint32_t first_vertex;
+    uint32_t first_instance;
+    uint32_t index_count;
+    uint32_t push_const_size;
+};
+
+static inline void tu_dump_init() {
+    if (!g_dump_file) {
+        g_dump_file = fopen("/data/local/tmp/turnip_dump.bin", "wb");
+    }
+}
+/* ================== END DUMP HEADER ================== */
+"""
+anchor_include = '#include "tu_trace_bin_layout.h"'
+content = safe_replace(content, anchor_include, header_code, "Global Header")
+
+# 2. 注入 VBO 映射指针获取
+vbo_code = """
+   /* === 插入 VBO 映射指针开始 === */
+   for (uint32_t i = 0; i < bindingCount; i++) {
+      if (pBuffers[i] == VK_NULL_HANDLE) {
+         g_vbo_mapped_ptrs[firstBinding + i] = NULL;
+      } else {
+         struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);
+         if (buf && buf->bo) {
+            tu_bo_map(cmd->device, buf->bo, NULL);
+            g_vbo_mapped_ptrs[firstBinding + i] = (uint8_t*)buf->bo->map + pOffsets[i];
+         }
+      }
+   }
+   /* === 插入 VBO 映射指针结束 === */
+"""
+anchor_vbo = "cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;"
+content = safe_replace(content, anchor_vbo, vbo_code, "VBO Mapping")
+
+# 3. 注入 Push Constants 截取
+push_code = """
+   /* === 插入 Push Constants 截取开始 === */
+   if (g_draw_count < MAX_DUMP_DRAWS) {
+       tu_dump_init();
+       if (g_dump_file && (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_VERTEX_BIT)) {
+           uint32_t magic = 0x50555348; // 'PUSH'
+           fwrite(&magic, sizeof(uint32_t), 1, g_dump_file);
+           fwrite(&pPushConstantsInfo->size, sizeof(uint32_t), 1, g_dump_file);
+           fwrite(pPushConstantsInfo->pValues, 1, pPushConstantsInfo->size, g_dump_file);
+           fflush(g_dump_file);
        }
    }
-'''
+   /* === 插入 Push Constants 截取结束 === */
+"""
+anchor_push = "cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;"
+content = safe_replace(content, anchor_push, push_code, "Push Constants")
 
-target_draw = 'tu_CmdDrawIndexed('
-start_idx = content.find(target_draw)
-if start_idx != -1:
-    # 寻找函数体内的 VK_FROM_HANDLE 宏，它定义了 cmd 变量
-    handle_str = 'VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);'
-    handle_idx = content.find(handle_str, start_idx)
-    
-    if handle_idx != -1:
-        # 将代码插在 VK_FROM_HANDLE 之后
-        insert_idx = handle_idx + len(handle_str)
-        content = content[:insert_idx] + '\n' + draw_hook_code + content[insert_idx:]
-        print('✅ CmdDrawIndexed 模型矩阵注入成功！')
-    else:
-        print('❌ 找不到 VK_FROM_HANDLE，注入失败')
-else:
-    print('❌ 找不到 tu_CmdDrawIndexed')
+# 4. 注入 Draw 截取
+draw_code = """
+   /* === 插入 Draw 截取开始 === */
+   if (g_draw_count < MAX_DUMP_DRAWS) {
+       tu_dump_init();
+       if (g_dump_file) {
+           struct DumpHeader header = { 0x54554450, 0, vertexCount, instanceCount, firstVertex, firstInstance, 0, 0 };
+           fwrite(&header, sizeof(header), 1, g_dump_file);
+           for (int i = 0; i < MAX_VBS; i++) {
+               if (g_vbo_mapped_ptrs[i]) {
+                   uint32_t dump_size = vertexCount * 32; 
+                   if (dump_size > 64 * 1024) dump_size = 64 * 1024;
+                   uint32_t vbo_magic = 0x56424F00 | (i & 0xFF); // 'VBO'
+                   fwrite(&vbo_magic, sizeof(uint32_t), 1, g_dump_file);
+                   fwrite(g_vbo_mapped_ptrs[i], 1, dump_size, g_dump_file);
+               }
+           }
+           fflush(g_dump_file);
+           g_draw_count++;
+       }
+   }
+   /* === 插入 Draw 截取结束 === */
+"""
+anchor_draw = "tu6_emit_vs_params(cmd, NULL, 0, firstVertex, firstInstance);"
+content = safe_replace(content, anchor_draw, draw_code, "CmdDraw")
 
-with open(file_path, 'w') as f:
+# 5. 注入 DrawIndexed 截取
+draw_indexed_code = """
+   /* === 插入 DrawIndexed 截取开始 === */
+   if (g_draw_count < MAX_DUMP_DRAWS) {
+       tu_dump_init();
+       if (g_dump_file) {
+           struct DumpHeader header = { 0x54554450, 1, indexCount, instanceCount, firstIndex, firstInstance, indexCount, 0 };
+           fwrite(&header, sizeof(header), 1, g_dump_file);
+           for (int i = 0; i < MAX_VBS; i++) {
+               if (g_vbo_mapped_ptrs[i]) {
+                   uint32_t dump_size = 64 * 1024; 
+                   uint32_t vbo_magic = 0x56424F00 | (i & 0xFF); // 'VBO'
+                   fwrite(&vbo_magic, sizeof(uint32_t), 1, g_dump_file);
+                   fwrite(g_vbo_mapped_ptrs[i], 1, dump_size, g_dump_file);
+               }
+           }
+           fflush(g_dump_file);
+           g_draw_count++;
+       }
+   }
+   /* === 插入 DrawIndexed 截取结束 === */
+"""
+anchor_draw_indexed = "tu6_emit_vs_params(cmd, NULL, 0, vertexOffset, firstInstance);"
+content = safe_replace(content, anchor_draw_indexed, draw_indexed_code, "CmdDrawIndexed")
+
+with open(file_path, "w", encoding="utf-8") as f:
     f.write(content)
+print("Injection successful! All 5 anchors replaced.")
 PYEOF
-
-    cd "$workdir/mesa-main"
-    python3 /tmp/inject.py
-    cd "$workdir"
 }
 
 build_lib_for_android(){
-    echo -e "${green}[4/6] 编译驱动...${nocolor}"
-    cd "$workdir/mesa-main"
-    
-    mkdir -p "$workdir/bin"
-    ln -sf "$ndk/clang" "$workdir/bin/cc"
-    ln -sf "$ndk/clang++" "$workdir/bin/c++"
-    export PATH="$workdir/bin:$ndk:$PATH"
-    export CC=clang
-    export CXX=clang++
-    export AR=llvm-ar
-    export LDFLAGS="-fuse-ld=lld"
+	#Workaround for using Clang as c compiler instead of GCC
+	mkdir -p "$workdir/bin"
+	ln -sf "$ndk/clang" "$workdir/bin/cc"
+	ln -sf "$ndk/clang++" "$workdir/bin/c++"
+	export PATH="$workdir/bin:$ndk:$PATH"
+	export CC=clang
+	export CXX=clang++
+	export AR=llvm-ar
+	export RANLIB=llvm-ranlib
+	export STRIP=llvm-strip
+	export OBJDUMP=llvm-objdump
+	export OBJCOPY=llvm-objcopy
+	export LDFLAGS="-fuse-ld=lld"
 
-    cat <<EOF >"android-aarch64.txt"
+	echo "Generating build files ..." $'\n'
+		cat <<EOF >"android-aarch64.txt"
 [binaries]
 ar = '$ndk/llvm-ar'
 c = ['ccache', '$ndk/aarch64-linux-android$sdkver-clang']
@@ -163,6 +231,7 @@ c_ld = '$ndk/ld.lld'
 cpp_ld = '$ndk/ld.lld'
 strip = '$ndk/aarch64-linux-android-strip'
 pkg-config = ['env', 'PKG_CONFIG_LIBDIR=$ndk/pkg-config', '/usr/bin/pkg-config']
+
 [host_machine]
 system = 'android'
 cpu_family = 'aarch64'
@@ -170,7 +239,7 @@ cpu = 'armv8'
 endian = 'little'
 EOF
 
-    cat <<EOF >"native.txt"
+		cat <<EOF >"native.txt"
 [build_machine]
 c = ['ccache', 'clang']
 cpp = ['ccache', 'clang++']
@@ -184,76 +253,113 @@ cpu = 'x86_64'
 endian = 'little'
 EOF
 
-    set +e
-    meson setup build-android-aarch64 --cross-file "android-aarch64.txt" --native-file "native.txt" \
-        -Dbuildtype=release -Dplatforms=android -Dplatform-sdk-version="$sdkver" \
-        -Dandroid-stub=true -Dgallium-drivers= -Dvulkan-drivers=freedreno \
-        -Dfreedreno-kmds=kgsl -Dstrip=true -Degl=disabled &> "$workdir/meson_log"
-    
-    if [ $? -ne 0 ]; then 
-        echo -e "${red}Meson 配置失败！日志如下：${nocolor}"
-        cat "$workdir/meson_log"
-        exit 1
-    fi
-    
-    ninja -C build-android-aarch64 &> "$workdir/ninja_log"
-    if [ $? -ne 0 ]; then 
-        echo -e "${red}Ninja 编译失败！日志如下：${nocolor}"
-        tail -n 50 "$workdir/ninja_log"
-        exit 1
-    fi
-    set -e
+		meson setup build-android-aarch64 \
+			--cross-file "android-aarch64.txt" \
+			--native-file "native.txt" \
+			-Dbuildtype=release \
+			-Dplatforms=android \
+			-Dplatform-sdk-version="$sdkver" \
+			-Dandroid-stub=true \
+			-Dgallium-drivers= \
+			-DVulkan-drivers=freedreno \
+			-DVulkan-beta=true \
+			-Dfreedreno-kmds=kgsl \
+			-Db_lto=true \
+			-Dstrip=true \
+			-Degl=disabled &> "$workdir/meson_log"
+
+	echo "Compiling build files ..." $'\n'
+		ninja -C build-android-aarch64 &> "$workdir/ninja_log"
+
+	if ! [ -a "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
+		echo -e "$red Build failed! $nocolor" && exit 1
+	fi
 }
 
 port_lib_for_magisk(){
-    echo -e "${green}[5/6] 打包 Magisk 模块...${nocolor}"
-    cd "$workdir"
-    cp mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so .
-    patchelf --set-soname vulkan.adreno.so libvulkan_freedreno.so
-    mv libvulkan_freedreno.so vulkan.adreno.so
-    
-    p1="system/vendor/lib64/hw"
-    rm -rf "$magiskdir"
-    mkdir -p "$magiskdir/$p1" && cd "$magiskdir"
-    
-    cat <<EOF >"module.prop"
-id=turnip_hook
-name=Turnip Hook
-version=1.0
-versionCode=1
-author=You
-description=Custom Turnip Model Hook
+	echo "Using patchelf to match soname ..." $'\n'
+		cp "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so "$workdir"
+		cd "$workdir"
+		patchelf --set-soname vulkan.adreno.so libvulkan_freedreno.so
+		mv libvulkan_freedreno.so vulkan.adreno.so
+
+	echo "Prepare magisk module structure ..." $'\n'
+		p1="system/vendor/lib64/hw"
+		mkdir -p "$magiskdir" && cd "$_"
+		mkdir -p "$p1"
+
+		meta="META-INF/com/google/android"
+		mkdir -p "$meta"
+
+		cat <<EOF >"$meta/update-binary"
+#################
+# Initialization
+#################
+umask 022
+ui_print() { echo "\$1"; }
+OUTFD=\$2
+ZIPFILE=\$3
+. /data/adb/magisk/util_functions.sh
+install_module
+exit 0
 EOF
-    cat <<EOF >"customize.sh"
+
+		cat <<EOF >"$meta/updater-script"
+#MAGISK
+EOF
+
+		cat <<EOF >"module.prop"
+id=turnip
+name=turnip
+version=$(cat $workdir/mesa-main/VERSION)
+versionCode=1
+author=MrMiy4mo
+description=Turnip is an open-source vulkan driver for devices with adreno GPUs.
+EOF
+
+		cat <<EOF >"customize.sh"
 set_perm_recursive \$MODPATH/system 0 0 755 u:object_r:system_file:s0
 set_perm_recursive \$MODPATH/system/vendor 0 2000 755 u:object_r:vendor_file:s0
 set_perm \$MODPATH/$p1/vulkan.adreno.so 0 0 0644 u:object_r:same_process_hal_file:s0
 EOF
-    cp "$workdir/vulkan.adreno.so" "$magiskdir/$p1/"
-    zip -r "$workdir/turnip_magisk.zip" ./* &> /dev/null
+
+	echo "Copy necessary files from work directory ..." $'\n'
+		cp "$workdir"/vulkan.adreno.so "$magiskdir"/"$p1"
+
+	echo "Packing files in to magisk module ..." $'\n'
+		zip -r "$workdir"/turnip.zip ./* &> /dev/null
+		if ! [ -a "$workdir"/turnip.zip ];
+			then echo -e "$red-Packing failed!$nocolor" && exit 1
+			else echo -e "$green-All done, the module saved to;$nocolor" && echo "$workdir"/turnip.zip
+		fi
 }
 
 port_lib_for_adrenotools(){
-    echo -e "${green}[6/6] 打包 AdrenoTools 驱动...${nocolor}"
-    libname="vulkan.freedreno.so"
-    cd "$workdir"
-    cp mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ./$libname
-    patchelf --set-soname $libname $libname
-    
-    cat <<EOF > "meta.json"
+	libname=vulkan.freedreno.so
+	echo "Using patchelf to match soname" $'\n'
+		cp "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so "$workdir"/$libname
+		cd "$workdir"
+		patchelf --set-soname $libname $libname
+	echo "Preparing meta.json" $'\n'
+		cat <<EOF > "meta.json"
 {
-    "schemaVersion": 1,
-    "name": "TurnipHook",
-    "author": "Me",
-    "packageVersion": "1",
-    "vendor": "Mesa",
-    "driverVersion": "1.0",
-    "minApi": 34,
-    "libraryName": "$libname"
+	"schemaVersion": 1,
+	"name": "freedreno_turnip-CI",
+	"description": "$(date)",
+	"author": "MrMiy4mo, kethen",
+	"packageVersion": "1",
+	"vendor": "Mesa",
+	"driverVersion": "$(cat $workdir/mesa-main/VERSION)",
+	"minApi": $sdkver,
+	"libraryName": "$libname"
 }
 EOF
-    zip -9 "$workdir/turnip_adrenotools.zip" $libname meta.json &> /dev/null
-    rm -f $libname meta.json
+
+	zip -9 "$workdir"/turnip_adrenotools.zip $libname meta.json &> /dev/null
+	if ! [ -a "$workdir"/turnip_adrenotools.zip ];
+		then echo -e "$red-Packing turnip_adrenotools.zip failed!$nocolor" && exit 1
+		else echo -e "$green-All done, the module saved to;$nocolor" && echo "$workdir"/turnip_adrenotools.zip
+	fi
 }
 
 run_all
