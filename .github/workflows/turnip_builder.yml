@@ -20,14 +20,25 @@ jobs:
     - name: Execute build script
       run: bash ./turnip_builder.sh
 
-    - name: Upload a Build Artifact
+    # =========================================================
+    # 【新增】上传提取出来的最新纯净版 tu_cmd_buffer.cc
+    # =========================================================
+    - name: Upload Original tu_cmd_buffer.cc
       uses: actions/upload-artifact@v4
       with:
-        name: Upload meson and ninja logs for debugging
+        name: original_tu_cmd_buffer
+        path: turnip_workdir/original_tu_cmd_buffer.zip
+
+    # 上传日志，路径已经修正为 mesa-src（防止找不到报错）
+    - name: Upload logs for debugging
+      uses: actions/upload-artifact@v4
+      with:
+        name: meson_ninja_logs
         path: |
           turnip_workdir/ninja_log
-          turnip_workdir/mesa-main/build-android-aarch64/meson-logs/meson-log.txt
+          turnip_workdir/mesa-src/build-android-aarch64/meson-logs/meson-log.txt
 
+    # 如果你的代码没问题，这里会生成最终的卡刷包
     - name: Release "turnip"
       uses: softprops/action-gh-release@v1
       with:
