@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在向 tu_cmd_buffer.cc 注入 覆盖式 ESP Dump 代码...${nocolor}"
+    echo -e "${green}正在注入 ESP Dump (修复版)...${nocolor}"
     cat << 'PYEOF' > inject.py
 import re
 
@@ -67,71 +67,56 @@ global_code = '''
 static float g_current_matrix[16] = {0};
 static uint64_t g_current_vbo_iova = 0;
 static uint32_t g_current_vbo_size = 0;
-static uint64_t g_current_ubo_iova = 0;
 
-// 日志和文件双管齐下
-static void dump_data_to_file(const char* func, uint32_t count, float* m, float* v) {
+static void extract_vertex_and_dump(struct tu_device *device, const char* func, uint32_t count) {
     mesa_loge("ESP_HIT: %s called!", func);
     
-    const char* paths[] = {
-        "/storage/emulated/0/vulkan_dump.txt",
-        "/data/local/tmp/vulkan_dump.txt",
-        "/sdcard/vulkan_dump.txt"
-    };
-    for (int i = 0; i < 3; i++) {
-        FILE *fp = fopen(paths[i], "a+");
+    if (g_current_vbo_iova == 0) return;
+    
+    struct tu_bo *bo = tu_device_lookup_bo(device, g_current_vbo_iova);
+    if (bo && bo->map) {
+        void *cpu_vbo_ptr = (void *)((char *)bo->map + (g_current_vbo_iova - bo->iova));
+        
+        const char* paths[] = {
+            "/storage/emulated/0/vulkan_dump.txt",
+            "/data/local/tmp/vulkan_dump.txt",
+            "/sdcard/vulkan_dump.txt"
+        };
+        
+        FILE *fp = NULL;
+        for (int i = 0; i < 3; i++) {
+            fp = fopen(paths[i], "a+");
+            if (fp) break;
+        }
+        
         if (fp) {
             fprintf(fp, "=== HIT: %s ===\\n", func);
             if (count > 0) fprintf(fp, "Count: %u\\n", count);
             
-            // 如果抓到了矩阵且不是全0
-            if (m) {
-                bool not_zero = false;
-                for(int j=0; j<16; j++) if(m[j] != 0.0f) { not_zero = true; break; }
-                if (not_zero) {
-                    fprintf(fp, "Matrix: ");
-                    for (int j = 0; j < 16; j++) fprintf(fp, "%f ", m[j]);
-                    fprintf(fp, "\\n");
-                }
+            bool not_zero = false;
+            for(int j=0; j<16; j++) if(g_current_matrix[j] != 0.0f) { not_zero = true; break; }
+            if (not_zero) {
+                fprintf(fp, "Matrix: ");
+                for (int j = 0; j < 16; j++) fprintf(fp, "%f ", g_current_matrix[j]);
+                fprintf(fp, "\\n");
             }
             
-            // 如果抓到了顶点
-            if (v) {
-                fprintf(fp, "Vertex: %f %f %f\\n", v[0], v[1], v[2]);
-            }
-            fprintf(fp, "\\n");
+            float* verts = (float*)cpu_vbo_ptr;
+            fprintf(fp, "Vertex: %f %f %f\\n\\n", verts[0], verts[1], verts[2]);
             fclose(fp);
-            break;
         }
-    }
-}
-
-static void extract_vertex_from_vbo(struct tu_device *device) {
-    if (g_current_vbo_iova == 0) return;
-    struct tu_bo *bo = tu_device_lookup_bo(device, g_current_vbo_iova);
-    if (bo && bo->map) {
-        float* verts = (float*)((char*)bo->map + (g_current_vbo_iova - bo->iova));
-        dump_data_to_file("Draw_Execute", 0, g_current_matrix, verts);
     }
 }
 '''
 
-# 1. 驱动加载确认
+# 1. 找最稳妥的锚点注入全局变量（enum tu_cmd_buffer_status 绝对存在）
+code = code.replace('enum tu_cmd_buffer_status {', global_code + '\nenum tu_cmd_buffer_status {')
+
+# 2. 驱动加载确认
 code = code.replace('tu_cmd_buffer_status_gpu_write(cmd_buffer, TU_CMD_BUFFER_STATUS_ACTIVE);', 
                     'mesa_loge("ESP_HIT: TURNIP DRIVER LOADED!");\n   tu_cmd_buffer_status_gpu_write(cmd_buffer, TU_CMD_BUFFER_STATUS_ACTIVE);')
 
-# 2. 截获 PushConstants (矩阵)
-code = code.replace(
-    'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n}\nTU_GENX(tu_CmdPushConstants2KHR);',
-    '''cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
-   if (pPushConstantsInfo->size >= 64) {
-       memcpy(g_current_matrix, pPushConstantsInfo->pValues, 64);
-   }
-}
-TU_GENX(tu_CmdPushConstants2KHR);'''
-)
-
-# 3. 截获 Descriptor Sets (UBO 数据)
+# 3. 截获 VBO (在 cmd 存在的作用域内)
 code = code.replace(
     'cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
     '''   if (bindingCount > 0) { 
@@ -143,26 +128,26 @@ code = code.replace(
     1
 )
 
-# 4. 在所有的 Draw 函数中打桩
-def inject_draw(code, func_name, count_var):
-    regex = r'(VKAPI_ATTR void VKAPI_CALL\n' + func_name + r'\([^)]+\)\n\{\n)'
-    def repl(m):
-        return m.group(1) + f'   mesa_loge("ESP_HIT: {func_name} called!");\n   extract_vertex_from_vbo(cmd->device);\n'
-    return re.sub(regex, repl, code)
+# 4. 截获 PushConstants (矩阵)
+code = code.replace(
+    'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n}\nTU_GENX(tu_CmdPushConstants2KHR);',
+    '''cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
+   if (pPushConstantsInfo->size >= 64) {
+       memcpy(g_current_matrix, pPushConstantsInfo->pValues, 64);
+   }
+}
+TU_GENX(tu_CmdPushConstants2KHR);'''
+)
 
-code = inject_draw(code, 'tu_CmdDraw', 'vertexCount')
-code = inject_draw(code, 'tu_CmdDrawIndexed', 'indexCount')
-code = inject_draw(code, 'tu_CmdDrawIndirect', '99999')
-code = inject_draw(code, 'tu_CmdDrawIndexedIndirect', '99999')
-code = inject_draw(code, 'tu_CmdDrawIndirectCount', '99999')
-code = inject_draw(code, 'tu_CmdDrawIndexedIndirectCount', '99999')
-
-# 5. 在 Dispatch (Compute) 中打桩
-regex_dispatch = r'(VKAPI_ATTR void VKAPI_CALL\ntu_CmdDispatchBase\([^)]+\)\n\{\n)'
-code = re.sub(regex_dispatch, r'\1   mesa_loge("ESP_HIT: tu_CmdDispatchBase called!");\n', code)
-
-# 6. 清理去重状态
-code = code.replace('return vk_command_buffer_end(&cmd_buffer->vk);', 'g_current_vbo_iova = 0;\n   return vk_command_buffer_end(&cmd_buffer->vk);')
+# 5. 在 Draw 函数里打桩（直接替换 tu6_draw_common，这里 100% 有 cmd）
+code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 
+                    'extract_vertex_and_dump(cmd->device, "tu_CmdDraw", vertexCount);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
+code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 
+                    'extract_vertex_and_dump(cmd->device, "tu_CmdDrawIndexed", indexCount);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
+code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, 0);', 
+                    'extract_vertex_and_dump(cmd->device, "tu_CmdDrawIndirect", 99999);\n   tu6_draw_common<CHIP>(cmd, cs, false, 0);')
+code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, 0);', 
+                    'extract_vertex_and_dump(cmd->device, "tu_CmdDrawIndexedIndirect", 99999);\n   tu6_draw_common<CHIP>(cmd, cs, true, 0);')
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
