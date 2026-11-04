@@ -20,9 +20,6 @@ jobs:
     - name: Execute build script
       run: bash ./turnip_builder.sh
 
-    # =========================================================
-    # 【核心修改】加上 if: always()，这样哪怕编译失败也会上传
-    # =========================================================
     - name: Upload Original tu_cmd_buffer.cc
       if: always()
       uses: actions/upload-artifact@v4
@@ -40,7 +37,7 @@ jobs:
           turnip_workdir/mesa-src/build-android-aarch64/meson-logs/meson-log.txt
 
     - name: Release "turnip"
-      if: success() # 只有编译成功才发布 Release
+      if: success()
       uses: softprops/action-gh-release@v1
       with:
         body: Turnip magisk module and driver package for adrenotools
