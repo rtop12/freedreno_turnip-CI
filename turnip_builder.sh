@@ -44,7 +44,6 @@ check_deps(){
 		fi
 
 	echo "Upgrading meson and installing python dependencies ..." $'\n'
-    # 强制升级 meson 到最新版，并安装 mako
 	pip install --upgrade meson mako &> /dev/null
 }
 
@@ -117,7 +116,7 @@ cpu = 'x86_64'
 endian = 'little'
 EOF
 
-        # 把 meson setup 的输出不隐藏，直接打印出来
+        # 【修改点】去掉了 -Db_lto=true，解决报错
 		meson setup build-android-aarch64 \
 			--cross-file "android-aarch64.txt" \
 			--native-file "native.txt" \
@@ -129,11 +128,10 @@ EOF
 			-Dvulkan-drivers=freedreno \
 			-Dvulkan-beta=true \
 			-Dfreedreno-kmds=kgsl \
-			-Db_lto=true \
 			-Dstrip=true \
 			-Degl=disabled 2>&1 | tee "$workdir/meson_log"
 
-        if [ $? -ne 0 ]; then
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
             echo -e "$red Meson setup failed! $nocolor"
             exit 1
         fi
