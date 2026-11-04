@@ -4,7 +4,7 @@
 green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
-deps="meson ninja patchelf unzip curl pip flex bison zip"
+deps="meson ninja patchelf unzip curl pip flex bison zip glslang-tools"
 workdir="$(pwd)/turnip_workdir"
 magiskdir="$workdir/turnip_module"
 ndkver="android-ndk-r28"
@@ -14,8 +14,6 @@ mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
 
 clear
 
-#There are 4 functions here, simply comment to disable.
-#You can insert your own function and make a pull request.
 run_all(){
 	check_deps
 	prepare_workdir
@@ -62,7 +60,7 @@ prepare_workdir(){
 		cd mesa-main
 }
 
-# ================= 新增：强行注入流出代码 =================
+# ================= 强行注入流出代码 =================
 inject_custom_code(){
 	echo "正在注入自定义 Turnip 流出代码..." $'\n'
 	
@@ -71,8 +69,8 @@ file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-# 1. 注入头文件
-content = content.replace('#include \"tu_cmd_buffer.h\"', '#include \"tu_cmd_buffer.h\"\n#include <stdio.h>\n#include <time.h>')
+# 1. 注入头文件 (加 freedreno_bo.h 防止指针报错)
+content = content.replace('#include \"tu_cmd_buffer.h\"', '#include \"tu_cmd_buffer.h\"\n#include \"freedreno_bo.h\"\n#include <stdio.h>\n#include <time.h>')
 
 # 2. 注入截获代码
 hook_code = '''
@@ -158,24 +156,38 @@ cpu = 'x86_64'
 endian = 'little'
 EOF
 
-		meson setup build-android-aarch64 \
-			--cross-file "android-aarch64.txt" \
-			--native-file "native.txt" \
-			-Dbuildtype=release \
-			-Dplatforms=android \
-			-Dplatform-sdk-version="$sdkver" \
-			-Dandroid-stub=true \
-			-Dgallium-drivers= \
-			-Dvulkan-drivers=freedreno \
-			-DVulkan-beta=true \
-			-Dfreedreno-kmds=kgsl \
-			-Db_lto=true \
-			-Dstrip=true \
-			-Degl=disabled &> "$workdir/meson_log"
+	# 临时关闭 -e，防止 meson 报错直接杀掉脚本，我们要把日志打印出来
+	set +e
+	meson setup build-android-aarch64 \
+		--cross-file "android-aarch64.txt" \
+		--native-file "native.txt" \
+		-Dbuildtype=release \
+		-Dplatforms=android \
+		-Dplatform-sdk-version="$sdkver" \
+		-Dandroid-stub=true \
+		-Dgallium-drivers= \
+		-Dvulkan-drivers=freedreno \
+		-DVulkan-beta=true \
+		-Dfreedreno-kmds=kgsl \
+		-Db_lto=true \
+		-Dstrip=true \
+		-Degl=disabled &> "$workdir/meson_log"
+
+	if [ $? -ne 0 ]; then
+		echo -e "${red}Meson setup failed!${nocolor}"
+		cat "$workdir/meson_log"
+		exit 1
+	fi
 
 	echo "Compiling build files ..." $'\n'
-		# 【重点修改】这里如果编译失败，会把真正的 C++ 报错打印出来
-		ninja -C build-android-aarch64 || (cat "$workdir/ninja_log" && exit 1)
+		ninja -C build-android-aarch64 &> "$workdir/ninja_log"
+	
+	if [ $? -ne 0 ]; then
+		echo -e "${red}Ninja build failed!${nocolor}"
+		cat "$workdir/ninja_log"
+		exit 1
+	fi
+	set -e
 
 	if ! [ -a "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
 		echo -e "$red Build failed! $nocolor" && exit 1
