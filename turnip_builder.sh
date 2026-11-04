@@ -54,9 +54,9 @@ prepare_workdir(){
 	cd mesa-main
 }
 
-# ================= 强行注入全量留存代码 =================
+# ================= 强行注入属性传值代码（无限制版） =================
 inject_custom_code(){
-	echo "正在注入全量留存代码..." $'\n'
+	echo "正在注入无限制属性传值代码..." $'\n'
 	
 	cat << 'PYEOF' > /tmp/inject.py
 import sys
@@ -65,38 +65,29 @@ file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-# 引入文件写入和计时相关的头文件
-content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>\n#include <stdint.h>')
+# 引入所需头文件
+content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <sys/system_properties.h>')
 
 hook_code = r'''
-         if (buf && buf->bo && buf->bo->size > 256) {
-            static long last_sec = 0;
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
+         if (buf && buf->bo && buf->bo->size > 128) {
+            void *map_addr = buf->bo->map;
+            if (map_addr == NULL) {
+               tu_bo_map(cmd->device, buf->bo, NULL);
+               map_addr = buf->bo->map;
+            }
             
-            // 【限频】每秒只抓取 1 次，防止游戏卡死
-            if (now.tv_sec > last_sec) {
-               last_sec = now.tv_sec;
-               
-               void *map_addr = buf->bo->map;
-               if (map_addr == NULL) {
-                  tu_bo_map(cmd->device, buf->bo, NULL);
-                  map_addr = buf->bo->map;
-               }
-               
-               if (map_addr) {
-                  // 【全量留存】写入到 /data/local/tmp/ 避免权限问题
-                  FILE *fp = fopen("/data/local/tmp/turnip_all_raw.bin", "ab");
-                  if (fp) {
-                     // 先写入这包数据的字节大小（4个字节），方便以后拆包
-                     uint32_t size = (uint32_t)buf->bo->size;
-                     fwrite(&size, sizeof(uint32_t), 1, fp);
-                     
-                     // 再写入真实的顶点数据
-                     fwrite(map_addr, 1, size, fp);
-                     fclose(fp);
-                  }
-               }
+            if (map_addr) {
+               float *verts = (float *)map_addr;
+               char prop_val[128];
+               // 提取前 9 个浮点数 (3个顶点 XYZ)
+               // 注意：系统属性有长度限制，最多容纳这么多
+               snprintf(prop_val, sizeof(prop_val), "%.2f,%.2f,%.2f|%.2f,%.2f,%.2f|%.2f,%.2f,%.2f", 
+                        verts[0], verts[1], verts[2], 
+                        verts[3], verts[4], verts[5], 
+                        verts[6], verts[7], verts[8]);
+                        
+               // 疯狂写入系统属性，不作任何限频
+               __system_property_set("debug.turnip.live", prop_val);
             }
          }
 '''
