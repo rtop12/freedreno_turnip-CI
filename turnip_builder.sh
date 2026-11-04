@@ -14,10 +14,12 @@ mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
 
 clear
 
+#There are 4 functions here, simply comment to disable.
+#You can insert your own function and make a pull request.
 run_all(){
 	check_deps
 	prepare_workdir
-	inject_dump_code
+	inject_dump_code       # <--- 注入抓取明文代码
 	build_lib_for_android
 	port_lib_for_magisk
 	port_lib_for_adrenotools
@@ -64,6 +66,7 @@ inject_dump_code(){
 	echo "Injecting DUMP code into tu_cmd_buffer.cc ..." $'\n'
 	cd "$workdir/mesa-main/src/freedreno/vulkan"
 	
+	# 使用 Python 脚本进行精准文本替换
 	python3 - <<'PYEOF'
 import sys
 
@@ -74,22 +77,23 @@ with open(file_path, "r", encoding="utf-8") as f:
 def safe_replace(content, anchor, code, name):
     if anchor not in content:
         print(f"ERROR: Could not find anchor for {name}!")
+        print(f"Expected anchor: {anchor}")
         sys.exit(1)
     return content.replace(anchor, code + "\n" + anchor, 1)
 
-# 1. 注入全局变量和结构体
+# 1. 注入全局变量和结构体 (注意这里路径改为了 /sdcard/)
 header_code = """
 #include <stdio.h>
 #include <stdlib.h>
 
-static uint8_t* g_vbo_mapped_ptrs[32] = {0};
+static uint8_t* g_vbo_mapped_ptrs[MAX_VBS] = {0};
 static FILE* g_dump_file = NULL;
 static uint32_t g_draw_count = 0;
 #define MAX_DUMP_DRAWS 5000 
 
 struct DumpHeader {
-    uint32_t magic;         
-    uint32_t draw_type;     
+    uint32_t magic;         // 'TUDP'
+    uint32_t draw_type;     // 0: Draw, 1: DrawIndexed
     uint32_t vertex_count;
     uint32_t instance_count;
     uint32_t first_vertex;
@@ -100,7 +104,8 @@ struct DumpHeader {
 
 static inline void tu_dump_init() {
     if (!g_dump_file) {
-        g_dump_file = fopen("/data/local/tmp/turnip_dump.bin", "wb");
+        // 改为了 /sdcard/ 根目录
+        g_dump_file = fopen("/sdcard/turnip_dump.bin", "wb");
     }
 }
 /* ================== END DUMP HEADER ================== */
@@ -117,7 +122,7 @@ vbo_code = """
       } else {
          struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);
          if (buf && buf->bo) {
-            (void)tu_bo_map(cmd->device, buf->bo, NULL);
+            tu_bo_map(cmd->device, buf->bo, NULL);
             g_vbo_mapped_ptrs[firstBinding + i] = (uint8_t*)buf->bo->map + pOffsets[i];
          }
       }
@@ -133,7 +138,7 @@ push_code = """
    if (g_draw_count < MAX_DUMP_DRAWS) {
        tu_dump_init();
        if (g_dump_file && (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_VERTEX_BIT)) {
-           uint32_t magic = 0x50555348; 
+           uint32_t magic = 0x50555348; // 'PUSH'
            fwrite(&magic, sizeof(uint32_t), 1, g_dump_file);
            fwrite(&pPushConstantsInfo->size, sizeof(uint32_t), 1, g_dump_file);
            fwrite(pPushConstantsInfo->pValues, 1, pPushConstantsInfo->size, g_dump_file);
@@ -153,11 +158,11 @@ draw_code = """
        if (g_dump_file) {
            struct DumpHeader header = { 0x54554450, 0, vertexCount, instanceCount, firstVertex, firstInstance, 0, 0 };
            fwrite(&header, sizeof(header), 1, g_dump_file);
-           for (int i = 0; i < 32; i++) {
+           for (int i = 0; i < MAX_VBS; i++) {
                if (g_vbo_mapped_ptrs[i]) {
                    uint32_t dump_size = vertexCount * 32; 
                    if (dump_size > 64 * 1024) dump_size = 64 * 1024;
-                   uint32_t vbo_magic = 0x56424F00 | (i & 0xFF); 
+                   uint32_t vbo_magic = 0x56424F00 | (i & 0xFF); // 'VBO'
                    fwrite(&vbo_magic, sizeof(uint32_t), 1, g_dump_file);
                    fwrite(g_vbo_mapped_ptrs[i], 1, dump_size, g_dump_file);
                }
@@ -179,10 +184,10 @@ draw_indexed_code = """
        if (g_dump_file) {
            struct DumpHeader header = { 0x54554450, 1, indexCount, instanceCount, firstIndex, firstInstance, indexCount, 0 };
            fwrite(&header, sizeof(header), 1, g_dump_file);
-           for (int i = 0; i < 32; i++) {
+           for (int i = 0; i < MAX_VBS; i++) {
                if (g_vbo_mapped_ptrs[i]) {
                    uint32_t dump_size = 64 * 1024; 
-                   uint32_t vbo_magic = 0x56424F00 | (i & 0xFF); 
+                   uint32_t vbo_magic = 0x56424F00 | (i & 0xFF); // 'VBO'
                    fwrite(&vbo_magic, sizeof(uint32_t), 1, g_dump_file);
                    fwrite(g_vbo_mapped_ptrs[i], 1, dump_size, g_dump_file);
                }
@@ -203,6 +208,7 @@ PYEOF
 }
 
 build_lib_for_android(){
+	#Workaround for using Clang as c compiler instead of GCC
 	mkdir -p "$workdir/bin"
 	ln -sf "$ndk/clang" "$workdir/bin/cc"
 	ln -sf "$ndk/clang++" "$workdir/bin/c++"
@@ -264,10 +270,10 @@ EOF
 			-Degl=disabled &> "$workdir/meson_log"
 
 	echo "Compiling build files ..." $'\n'
-	# 关键修改：让 ninja 报错直接输出到终端，而不是默默写进文件
-	if ! ninja -C build-android-aarch64 | tee "$workdir/ninja_log"; then
-		echo -e "$red Build failed! Check the log above. $nocolor"
-		exit 1
+		ninja -C build-android-aarch64 &> "$workdir/ninja_log"
+
+	if ! [ -a "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
+		echo -e "$red Build failed! $nocolor" && exit 1
 	fi
 }
 
