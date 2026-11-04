@@ -54,9 +54,9 @@ prepare_workdir(){
 	cd mesa-main
 }
 
-# ================= 强行注入属性传值代码（无限制版） =================
+# ================= 强行注入：直接把二进制明文写进文件 =================
 inject_custom_code(){
-	echo "正在注入无限制属性传值代码..." $'\n'
+	echo "正在注入二进制提取代码..." $'\n'
 	
 	cat << 'PYEOF' > /tmp/inject.py
 import sys
@@ -65,11 +65,12 @@ file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-# 引入所需头文件
-content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <sys/system_properties.h>')
+# 引入文件写入所需的头文件
+content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <sys/stat.h>')
 
 hook_code = r'''
-         if (buf && buf->bo && buf->bo->size > 128) {
+         // 遍历所有大小超过 256 字节的 Buffer（过滤掉 UI 等无用小数据）
+         if (buf && buf->bo && buf->bo->size > 256) {
             void *map_addr = buf->bo->map;
             if (map_addr == NULL) {
                tu_bo_map(cmd->device, buf->bo, NULL);
@@ -77,17 +78,20 @@ hook_code = r'''
             }
             
             if (map_addr) {
-               float *verts = (float *)map_addr;
-               char prop_val[128];
-               // 提取前 9 个浮点数 (3个顶点 XYZ)
-               // 注意：系统属性有长度限制，最多容纳这么多
-               snprintf(prop_val, sizeof(prop_val), "%.2f,%.2f,%.2f|%.2f,%.2f,%.2f|%.2f,%.2f,%.2f", 
-                        verts[0], verts[1], verts[2], 
-                        verts[3], verts[4], verts[5], 
-                        verts[6], verts[7], verts[8]);
-                        
-               // 疯狂写入系统属性，不作任何限频
-               __system_property_set("debug.turnip.live", prop_val);
+               // 以追加二进制模式打开文件
+               FILE *fp = fopen("/sdcard/turnip_mesh.bin", "ab");
+               if (fp) {
+                  // 只提取前 4096 字节（约1000个顶点数据），防止文件无限膨胀导致卡死
+                  uint32_t read_size = buf->bo->size < 4096 ? buf->bo->size : 4096;
+                  
+                  // 写入 4 字节的标记头，方便后续用 Python 拆分分析
+                  uint32_t tag = 0x11223344;
+                  fwrite(&tag, 1, 4, fp);
+                  
+                  // 写入真实的二进制浮点明文数据！
+                  fwrite(map_addr, 1, read_size, fp);
+                  fclose(fp);
+               }
             }
          }
 '''
