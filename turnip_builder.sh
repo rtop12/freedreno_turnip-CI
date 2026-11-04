@@ -1,5 +1,6 @@
 #!/bin/bash -e
 
+export TERM=xterm
 #Define variables
 green='\033[0;32m'
 red='\033[0;31m'
@@ -12,13 +13,12 @@ ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
 sdkver="34"
 mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
 
-# Check if custom tu_cmd_buffer.cc exists in the current directory
-CUSTOM_CMD_BUFFER="./tu_cmd_buffer.cc"
+# 获取当前脚本所在的根目录（绝对路径）
+REPO_ROOT="$(pwd)"
 
 clear
 
 #There are 4 functions here, simply comment to disable.
-#You can insert your own function and make a pull request.
 run_all(){
 	check_deps
 	prepare_workdir
@@ -64,13 +64,13 @@ prepare_workdir(){
 		cd mesa-main
 
 	# =========================================================================
-	# 核心修改点：在这里替换你魔改的 tu_cmd_buffer.cc
+	# 核心修改点：使用 REPO_ROOT 绝对路径去替换，绝对不会找不到！
 	# =========================================================================
-	if [ -f "../tu_cmd_buffer.cc" ]; then
-		echo -e "${green}Found custom tu_cmd_buffer.cc, applying patch ...${nocolor}" $'\n'
-		cp "../tu_cmd_buffer.cc" src/freedreno/vulkan/tu_cmd_buffer.cc
+	if [ -f "$REPO_ROOT/tu_cmd_buffer.cc" ]; then
+		echo -e "${green}Found custom tu_cmd_buffer.cc at $REPO_ROOT, applying patch ...${nocolor}" $'\n'
+		cp "$REPO_ROOT/tu_cmd_buffer.cc" src/freedreno/vulkan/tu_cmd_buffer.cc
 	else
-		echo -e "${red}WARNING: custom tu_cmd_buffer.cc NOT FOUND! Building original code.${nocolor}" $'\n'
+		echo -e "${red}WARNING: custom tu_cmd_buffer.cc NOT FOUND at $REPO_ROOT! Building original code.${nocolor}" $'\n'
 	fi
 	# =========================================================================
 }
@@ -141,7 +141,7 @@ EOF
 		ninja -C build-android-aarch64 &> "$workdir/ninja_log"
 
 	if ! [ -a "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
-		echo -e "$red Build failed! Check $workdir/ninja_log for details. $nocolor" && exit 1
+		echo -e "$red Build failed! Check the log above. $nocolor" && exit 1
 	fi
 }
 
