@@ -81,6 +81,7 @@ hook_code = '''
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             long diff_ms = (now.tv_sec - last_time.tv_sec) * 1000 + (now.tv_nsec - last_time.tv_nsec) / 1000000;
+            
             if (diff_ms >= 200) {
                void *map_addr = fd_bo_map(buf->bo);
                if (map_addr) {
@@ -173,7 +174,8 @@ EOF
 			-Degl=disabled &> "$workdir/meson_log"
 
 	echo "Compiling build files ..." $'\n'
-		ninja -C build-android-aarch64 &> "$workdir/ninja_log"
+		# 【重点修改】这里如果编译失败，会把真正的 C++ 报错打印出来
+		ninja -C build-android-aarch64 || (cat "$workdir/ninja_log" && exit 1)
 
 	if ! [ -a "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
 		echo -e "$red Build failed! $nocolor" && exit 1
