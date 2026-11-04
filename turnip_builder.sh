@@ -22,6 +22,7 @@ run_all(){
 }
 
 check_deps(){
+	echo "Checking for required Dependencies ..."
     sudo apt-get update -qq
     sudo apt-get install -y glslang-tools python3-pip zip unzip curl patchelf
 	pip install mako &> /dev/null
@@ -36,9 +37,9 @@ prepare_workdir(){
 	cd mesa-main
 }
 
-# ================= 注入代码：暴力提取所有绑定的 Buffer 数据 =================
+# ================= 终极雷达扫描注入代码 =================
 inject_custom_code(){
-	echo "正在注入渲染前明文提取代码..." $'\n'
+	echo "正在注入雷达扫描代码..." $'\n'
 	
 	cat << 'PYEOF' > /tmp/inject.py
 import sys
@@ -50,47 +51,49 @@ with open(file_path, 'r') as f:
 content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>\n#include <stdint.h>')
 
 hook_code = r'''
-         // 遍历所有绑定的 Buffer (不仅仅是 i=0)
-         for (uint32_t idx = 0; idx < bindingCount; idx++) {
-             if (pBuffers[idx] == VK_NULL_HANDLE) continue;
+         // 只要 Buffer 够大（大于 1KB），我们就像雷达一样全盘扫描
+         if (buf && buf->bo && buf->bo->size > 1024 && buf->bo->size < 5000000) {
+             static long last_sec = 0;
+             struct timespec now;
+             clock_gettime(CLOCK_MONOTONIC, &now);
              
-             struct tu_buffer *b = tu_buffer_from_handle(pBuffers[idx]);
-             if (b && b->bo && b->bo->size > 500) {
+             if (now.tv_sec != last_sec) {
+                 last_sec = now.tv_sec;
                  
-                 static long last_sec = 0;
-                 struct timespec now;
-                 clock_gettime(CLOCK_MONOTONIC, &now);
+                 void *map_addr = buf->bo->map;
+                 if (map_addr == NULL) {
+                     tu_bo_map(cmd->device, buf->bo, NULL);
+                     map_addr = buf->bo->map;
+                 }
                  
-                 // 每秒只抓一次，防止瞬间卡死
-                 if (now.tv_sec > last_sec) {
-                     last_sec = now.tv_sec;
+                 if (map_addr) {
+                     float *f_data = (float *)map_addr;
+                     uint32_t total_floats = buf->bo->size / 4;
                      
-                     void *map_addr = b->bo->map;
-                     if (map_addr == NULL) {
-                         tu_bo_map(cmd->device, b->bo, NULL);
-                         map_addr = b->bo->map;
-                     }
-                     
-                     if (map_addr) {
-                         float *verts = (float *)map_addr;
+                     FILE *fp = fopen("/sdcard/turnip_radar.txt", "a");
+                     if (fp) {
+                         fprintf(fp, "\n>>> 扫描到巨型Buffer，大小: %u 字节 <<<\n", (uint32_t)buf->bo->size);
                          
-                         // 简单过滤：如果前三个数全为0，说明可能是空数据或UI
-                         if (!(verts[0] == 0.0f && verts[1] == 0.0f && verts[2] == 0.0f)) {
+                         int found_count = 0;
+                         // 遍历整个 Buffer 里的所有浮点数
+                         for (uint32_t k = 0; k < total_floats - 2; k++) {
+                             float x = f_data[k];
+                             float y = f_data[k+1];
+                             float z = f_data[k+2];
                              
-                             FILE *fp = fopen("/sdcard/turnip_vertex_data.txt", "a");
-                             if (fp) {
-                                 // 打印哪个 Buffer，大小是多少
-                                 fprintf(fp, "\n>>> Buffer[%u] Size: %u bytes <<<\n", idx, (uint32_t)b->bo->size);
+                             // 【核心雷达】寻找符合 3D 世界坐标特征的数据
+                             // 特征：在 -5000 到 5000 之间，且不是 0，且带有小数
+                             if (x > -5000 && x < 5000 && y > -5000 && y < 5000 && z > -5000 && z < 5000 &&
+                                 x != 0.0f && y != 0.0f && z != 0.0f &&
+                                 (x != (int)x || y != (int)y || z != (int)z)) {
                                  
-                                 // 打印前 15 个顶点（45个float），足够判断是不是坐标了
-                                 for (int k = 0; k < 15; k++) {
-                                     if ((k * 3 + 2) * sizeof(float) < b->bo->size) {
-                                         fprintf(fp, "%.2f, %.2f, %.2f\n", verts[k*3], verts[k*3+1], verts[k*3+2]);
-                                     }
-                                 }
-                                 fclose(fp);
+                                 fprintf(fp, "定位到: X: %.3f, Y: %.3f, Z: %.3f\n", x, y, z);
+                                 found_count++;
+                                 // 一帧只打印 20 个，防止文件爆掉
+                                 if (found_count > 20) break; 
                              }
                          }
+                         fclose(fp);
                      }
                  }
              }
@@ -98,9 +101,8 @@ hook_code = r'''
 '''
 
 target_str = 'struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);'
-# 我们把代码插在函数最前面，用我们自己写的循环遍历，所以不需要原来的 buf 了
 if target_str in content:
-    content = content.replace(target_str, hook_code + '\n         ' + target_str)
+    content = content.replace(target_str, target_str + '\n' + hook_code)
     print('✅ 源码注入成功！')
 else:
     print('❌ 找不到目标函数')
