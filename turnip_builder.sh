@@ -12,7 +12,8 @@ magiskdir="$workdir/turnip_module"
 ndkver="android-ndk-r28"
 ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
 sdkver="34"
-mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
+# 【重要修改】：锁定 Mesa 源码版本为 24.0.0，解决 API 严重不兼容的问题
+mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/mesa-24.0.0/mesa-24.0.0.zip"
 
 REPO_ROOT="$(pwd)"
 
@@ -56,11 +57,12 @@ prepare_workdir(){
 	echo "Exracting android-ndk ..." $'\n'
 		unzip -q "$ndkver"-linux.zip &> /dev/null
 
-	echo "Downloading mesa source ..." $'\n'
-		curl -L "$mesasrc" --output mesa-main.zip &> /dev/null
+	echo "Downloading mesa source (mesa-24.0.0) ..." $'\n'
+		curl -L "$mesasrc" --output mesa-src.zip &> /dev/null
 	echo "Exracting mesa source ..." $'\n'
-		unzip -q mesa-main.zip &> /dev/null
-		cd mesa-main
+		unzip -q mesa-src.zip &> /dev/null
+		# 注意：解压出来的文件夹现在叫 mesa-mesa-24.0.0
+		cd mesa-mesa-24.0.0
 
 	if [ -f "$REPO_ROOT/tu_cmd_buffer.cc" ]; then
 		echo -e "${green}Found custom tu_cmd_buffer.cc, applying patch ...${nocolor}" $'\n'
@@ -116,7 +118,6 @@ cpu = 'x86_64'
 endian = 'little'
 EOF
 
-        # 【修改点】去掉了 -Db_lto=true，解决报错
 		meson setup build-android-aarch64 \
 			--cross-file "android-aarch64.txt" \
 			--native-file "native.txt" \
@@ -139,7 +140,8 @@ EOF
 	echo "Compiling build files ..." $'\n'
 		ninja -C build-android-aarch64 2>&1 | tee "$workdir/ninja_log"
 
-	if ! [ -a "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
+	# 注意：路径里的文件夹名改成了 mesa-mesa-24.0.0
+	if ! [ -a "$workdir"/mesa-mesa-24.0.0/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
 		echo -e "$red Build failed! $nocolor" 
 		exit 1
 	fi
@@ -147,7 +149,7 @@ EOF
 
 port_lib_for_magisk(){
 	echo "Using patchelf to match soname ..." $'\n'
-		cp "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so "$workdir"
+		cp "$workdir"/mesa-mesa-24.0.0/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so "$workdir"
 		cd "$workdir"
 		patchelf --set-soname vulkan.adreno.so libvulkan_freedreno.so
 		mv libvulkan_freedreno.so vulkan.adreno.so
@@ -180,7 +182,7 @@ EOF
 		cat <<EOF >"module.prop"
 id=turnip
 name=turnip
-version=$(cat $workdir/mesa-main/VERSION)
+version=$(cat $workdir/mesa-mesa-24.0.0/VERSION)
 versionCode=1
 author=MrMiy4mo
 description=Turnip is an open-source vulkan driver for devices with adreno GPUs.
@@ -206,7 +208,7 @@ EOF
 port_lib_for_adrenotools(){
 	libname=vulkan.freedreno.so
 	echo "Using patchelf to match soname" $'\n'
-		cp "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so "$workdir"/$libname
+		cp "$workdir"/mesa-mesa-24.0.0/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so "$workdir"/$libname
 		cd "$workdir"
 		patchelf --set-soname $libname $libname
 	echo "Preparing meta.json" $'\n'
@@ -218,7 +220,7 @@ port_lib_for_adrenotools(){
 	"author": "MrMiy4mo, kethen",
 	"packageVersion": "1",
 	"vendor": "Mesa",
-	"driverVersion": "$(cat $workdir/mesa-main/VERSION)",
+	"driverVersion": "$(cat $workdir/mesa-mesa-24.0.0/VERSION)",
 	"minApi": $sdkver,
 	"libraryName": "$libname"
 }
