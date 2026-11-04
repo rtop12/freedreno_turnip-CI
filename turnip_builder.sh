@@ -22,26 +22,8 @@ run_all(){
 }
 
 check_deps(){
-	echo "Checking system for required Dependencies ..."
-    echo "Installing missing system tools ..."
     sudo apt-get update -qq
     sudo apt-get install -y glslang-tools python3-pip zip unzip curl patchelf
-
-	for deps_chk in $deps;
-		do
-			sleep 0.25
-			if command -v "$deps_chk" >/dev/null 2>&1 ; then
-				echo -e "$green - $deps_chk found $nocolor"
-			else
-				echo -e "$red - $deps_chk not found $nocolor"
-				deps_missing=1
-			fi;
-		done
-
-	if [ "$deps_missing" == "1" ]
-		then exit 1
-	fi
-
 	pip install mako &> /dev/null
 }
 
@@ -54,9 +36,9 @@ prepare_workdir(){
 	cd mesa-main
 }
 
-# ================= 强行注入：直接把二进制明文写进文件 =================
+# ================= 注入代码：暴力提取所有绑定的 Buffer 数据 =================
 inject_custom_code(){
-	echo "正在注入二进制提取代码..." $'\n'
+	echo "正在注入渲染前明文提取代码..." $'\n'
 	
 	cat << 'PYEOF' > /tmp/inject.py
 import sys
@@ -65,40 +47,60 @@ file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-# 引入文件写入所需的头文件
-content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <sys/stat.h>')
+content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>\n#include <stdint.h>')
 
 hook_code = r'''
-         // 遍历所有大小超过 256 字节的 Buffer（过滤掉 UI 等无用小数据）
-         if (buf && buf->bo && buf->bo->size > 256) {
-            void *map_addr = buf->bo->map;
-            if (map_addr == NULL) {
-               tu_bo_map(cmd->device, buf->bo, NULL);
-               map_addr = buf->bo->map;
-            }
-            
-            if (map_addr) {
-               // 以追加二进制模式打开文件
-               FILE *fp = fopen("/sdcard/turnip_mesh.bin", "ab");
-               if (fp) {
-                  // 只提取前 4096 字节（约1000个顶点数据），防止文件无限膨胀导致卡死
-                  uint32_t read_size = buf->bo->size < 4096 ? buf->bo->size : 4096;
-                  
-                  // 写入 4 字节的标记头，方便后续用 Python 拆分分析
-                  uint32_t tag = 0x11223344;
-                  fwrite(&tag, 1, 4, fp);
-                  
-                  // 写入真实的二进制浮点明文数据！
-                  fwrite(map_addr, 1, read_size, fp);
-                  fclose(fp);
-               }
-            }
+         // 遍历所有绑定的 Buffer (不仅仅是 i=0)
+         for (uint32_t idx = 0; idx < bindingCount; idx++) {
+             if (pBuffers[idx] == VK_NULL_HANDLE) continue;
+             
+             struct tu_buffer *b = tu_buffer_from_handle(pBuffers[idx]);
+             if (b && b->bo && b->bo->size > 500) {
+                 
+                 static long last_sec = 0;
+                 struct timespec now;
+                 clock_gettime(CLOCK_MONOTONIC, &now);
+                 
+                 // 每秒只抓一次，防止瞬间卡死
+                 if (now.tv_sec > last_sec) {
+                     last_sec = now.tv_sec;
+                     
+                     void *map_addr = b->bo->map;
+                     if (map_addr == NULL) {
+                         tu_bo_map(cmd->device, b->bo, NULL);
+                         map_addr = b->bo->map;
+                     }
+                     
+                     if (map_addr) {
+                         float *verts = (float *)map_addr;
+                         
+                         // 简单过滤：如果前三个数全为0，说明可能是空数据或UI
+                         if (!(verts[0] == 0.0f && verts[1] == 0.0f && verts[2] == 0.0f)) {
+                             
+                             FILE *fp = fopen("/sdcard/turnip_vertex_data.txt", "a");
+                             if (fp) {
+                                 // 打印哪个 Buffer，大小是多少
+                                 fprintf(fp, "\n>>> Buffer[%u] Size: %u bytes <<<\n", idx, (uint32_t)b->bo->size);
+                                 
+                                 // 打印前 15 个顶点（45个float），足够判断是不是坐标了
+                                 for (int k = 0; k < 15; k++) {
+                                     if ((k * 3 + 2) * sizeof(float) < b->bo->size) {
+                                         fprintf(fp, "%.2f, %.2f, %.2f\n", verts[k*3], verts[k*3+1], verts[k*3+2]);
+                                     }
+                                 }
+                                 fclose(fp);
+                             }
+                         }
+                     }
+                 }
+             }
          }
 '''
 
 target_str = 'struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);'
+# 我们把代码插在函数最前面，用我们自己写的循环遍历，所以不需要原来的 buf 了
 if target_str in content:
-    content = content.replace(target_str, target_str + '\n' + hook_code)
+    content = content.replace(target_str, hook_code + '\n         ' + target_str)
     print('✅ 源码注入成功！')
 else:
     print('❌ 找不到目标函数')
@@ -157,7 +159,6 @@ EOF
 		-Dandroid-stub=true -Dgallium-drivers= -Dvulkan-drivers=freedreno \
 		-Dfreedreno-kmds=kgsl -Dstrip=true -Degl=disabled &> "$workdir/meson_log"
 	if [ $? -ne 0 ]; then cat "$workdir/meson_log"; exit 1; fi
-
 	ninja -C build-android-aarch64 &> "$workdir/ninja_log"
 	if [ $? -ne 0 ]; then cat "$workdir/ninja_log"; exit 1; fi
 	set -e
