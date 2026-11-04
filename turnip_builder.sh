@@ -25,37 +25,34 @@ run_all(){
 
 check_deps(){
 	echo "Checking system for required Dependencies ..."
-		for deps_chk in $deps; do
-			sleep 0.25
-			if command -v "$deps_chk" >/dev/null 2>&1 ; then
-				echo -e "$green - $deps_chk found $nocolor"
-			else
-				echo -e "$red - $deps_chk not found $nocolor"
-				deps_missing=1
-			fi;
-		done
-		if [ "$deps_missing" == "1" ]; then echo "Please install missing dependencies" && exit 1; fi
-	echo "Installing python dependencies ..." $'\n'
-		pip install --upgrade meson mako &> /dev/null
+	for deps_chk in $deps; do
+		sleep 0.25
+		if command -v "$deps_chk" >/dev/null 2>&1 ; then
+			echo -e "$green - $deps_chk found $nocolor"
+		else
+			echo -e "$red - $deps_chk not found $nocolor"
+			deps_missing=1
+		fi;
+	done
+	if [ "$deps_missing" == "1" ]; then echo "Please install missing dependencies" && exit 1; fi
+	pip install --upgrade meson mako &> /dev/null
 }
 
 prepare_workdir(){
 	echo "Preparing work directory ..." $'\n'
-		mkdir -p "$workdir" && cd "$_"
+	mkdir -p "$workdir" && cd "$_"
 
-	echo "Downloading android-ndk ..." $'\n'
-		curl -L https://dl.google.com/android/repository/"$ndkver"-linux.zip --output "$ndkver"-linux.zip &> /dev/null
-		unzip -q "$ndkver"-linux.zip &> /dev/null
+	curl -L https://dl.google.com/android/repository/"$ndkver"-linux.zip --output "$ndkver"-linux.zip &> /dev/null
+	unzip -q "$ndkver"-linux.zip &> /dev/null
 
-	echo "Downloading mesa source (main) ..." $'\n'
-		curl -L "$mesasrc" --output mesa-src.zip &> /dev/null
-		unzip -q mesa-src.zip &> /dev/null
+	curl -L "$mesasrc" --output mesa-src.zip &> /dev/null
+	unzip -q mesa-src.zip &> /dev/null
 		
     MESA_DIR=$(find . -maxdepth 1 -type d -name "mesa-*" ! -name "mesa-src.zip" | head -n 1)
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在向 tu_cmd_buffer.cc 注入 ESP Dump 代码...${nocolor}"
+    echo -e "${green}正在向 tu_cmd_buffer.cc 注入 覆盖式 ESP Dump 代码...${nocolor}"
     cat << 'PYEOF' > inject.py
 import re
 
@@ -70,57 +67,102 @@ global_code = '''
 static float g_current_matrix[16] = {0};
 static uint64_t g_current_vbo_iova = 0;
 static uint32_t g_current_vbo_size = 0;
-static uint64_t g_last_vbo_iova = 0;
+static uint64_t g_current_ubo_iova = 0;
 
-static void dump_draw_data(struct tu_device *device, uint32_t count) {
-    if (count < 500 || g_current_vbo_iova == 0) return;
-    if (g_current_vbo_iova == g_last_vbo_iova) return;
-    g_last_vbo_iova = g_current_vbo_iova;
-
-    struct tu_bo *bo = tu_device_lookup_bo(device, g_current_vbo_iova);
-    if (bo && bo->map) {
-        uint64_t offset_in_bo = g_current_vbo_iova - bo->iova;
-        void *cpu_vbo_ptr = (void *)((char *)bo->map + offset_in_bo);
-
-        // 强行写 /data/local/tmp/，配合 Magisk 脚本提权
-        FILE *fp = fopen("/data/local/tmp/vulkan_dump.txt", "a+");
+// 日志和文件双管齐下
+static void dump_data_to_file(const char* func, uint32_t count, float* m, float* v) {
+    mesa_loge("ESP_HIT: %s called!", func);
+    
+    const char* paths[] = {
+        "/storage/emulated/0/vulkan_dump.txt",
+        "/data/local/tmp/vulkan_dump.txt",
+        "/sdcard/vulkan_dump.txt"
+    };
+    for (int i = 0; i < 3; i++) {
+        FILE *fp = fopen(paths[i], "a+");
         if (fp) {
-            fprintf(fp, "--- Draw Call (Count: %u) ---\\n", count);
-            fprintf(fp, "Matrix: ");
-            for (int i = 0; i < 16; i++) fprintf(fp, "%f, ", g_current_matrix[i]);
-            fprintf(fp, "\\nVertices:\\n");
+            fprintf(fp, "=== HIT: %s ===\\n", func);
+            if (count > 0) fprintf(fp, "Count: %u\\n", count);
             
-            float* verts = (float*)cpu_vbo_ptr;
-            uint32_t num_verts = (g_current_vbo_size / 12);
-            if (num_verts > 5) num_verts = 5; 
-            for (uint32_t v = 0; v < num_verts; v++) {
-                fprintf(fp, "  V%d: X=%f, Y=%f, Z=%f\\n", v, verts[v*3], verts[v*3+1], verts[v*3+2]);
+            // 如果抓到了矩阵且不是全0
+            if (m) {
+                bool not_zero = false;
+                for(int j=0; j<16; j++) if(m[j] != 0.0f) { not_zero = true; break; }
+                if (not_zero) {
+                    fprintf(fp, "Matrix: ");
+                    for (int j = 0; j < 16; j++) fprintf(fp, "%f ", m[j]);
+                    fprintf(fp, "\\n");
+                }
+            }
+            
+            // 如果抓到了顶点
+            if (v) {
+                fprintf(fp, "Vertex: %f %f %f\\n", v[0], v[1], v[2]);
             }
             fprintf(fp, "\\n");
             fclose(fp);
+            break;
         }
     }
 }
-'''
-code = code.replace('#include "tu_trace_bin_layout.h"', '#include "tu_trace_bin_layout.h"\n' + global_code)
 
+static void extract_vertex_from_vbo(struct tu_device *device) {
+    if (g_current_vbo_iova == 0) return;
+    struct tu_bo *bo = tu_device_lookup_bo(device, g_current_vbo_iova);
+    if (bo && bo->map) {
+        float* verts = (float*)((char*)bo->map + (g_current_vbo_iova - bo->iova));
+        dump_data_to_file("Draw_Execute", 0, g_current_matrix, verts);
+    }
+}
+'''
+
+# 1. 驱动加载确认
+code = code.replace('tu_cmd_buffer_status_gpu_write(cmd_buffer, TU_CMD_BUFFER_STATUS_ACTIVE);', 
+                    'mesa_loge("ESP_HIT: TURNIP DRIVER LOADED!");\n   tu_cmd_buffer_status_gpu_write(cmd_buffer, TU_CMD_BUFFER_STATUS_ACTIVE);')
+
+# 2. 截获 PushConstants (矩阵)
 code = code.replace(
     'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n}\nTU_GENX(tu_CmdPushConstants2KHR);',
-    'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n   if (pPushConstantsInfo->size >= 64) memcpy(g_current_matrix, pPushConstantsInfo->pValues, 64);\n}\nTU_GENX(tu_CmdPushConstants2KHR);'
+    '''cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
+   if (pPushConstantsInfo->size >= 64) {
+       memcpy(g_current_matrix, pPushConstantsInfo->pValues, 64);
+   }
+}
+TU_GENX(tu_CmdPushConstants2KHR);'''
 )
 
+# 3. 截获 Descriptor Sets (UBO 数据)
 code = code.replace(
     'cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
-    '   if (bindingCount > 0) { g_current_vbo_iova = cmd->state.vb[firstBinding].base; g_current_vbo_size = cmd->state.vb[firstBinding].size; }\n   cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
+    '''   if (bindingCount > 0) { 
+       g_current_vbo_iova = cmd->state.vb[firstBinding].base; 
+       g_current_vbo_size = cmd->state.vb[firstBinding].size; 
+   }
+   cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;
+}\n''',
     1
 )
 
-code = code.replace('tu6_emit_vs_params(cmd, NULL, 0, firstVertex, firstInstance);\n\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 'dump_draw_data(cmd->device, vertexCount);\n   tu6_emit_vs_params(cmd, NULL, 0, firstVertex, firstInstance);\n\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
-code = code.replace('tu6_emit_vs_params(cmd, NULL, 0, vertexOffset, firstInstance);\n\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 'dump_draw_data(cmd->device, indexCount);\n   tu6_emit_vs_params(cmd, NULL, 0, vertexOffset, firstInstance);\n\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
-code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, 0);\n\n   const uint32_t dst_off = vs_params_offset(cmd);', 'dump_draw_data(cmd->device, 99999);\n   tu6_draw_common<CHIP>(cmd, cs, false, 0);\n\n   const uint32_t dst_off = vs_params_offset(cmd);')
-code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, 0);\n\n   const uint32_t dst_off = vs_params_offset(cmd);', 'dump_draw_data(cmd->device, 99999);\n   tu6_draw_common<CHIP>(cmd, cs, true, 0);\n\n   const uint32_t dst_off = vs_params_offset(cmd);')
+# 4. 在所有的 Draw 函数中打桩
+def inject_draw(code, func_name, count_var):
+    regex = r'(VKAPI_ATTR void VKAPI_CALL\n' + func_name + r'\([^)]+\)\n\{\n)'
+    def repl(m):
+        return m.group(1) + f'   mesa_loge("ESP_HIT: {func_name} called!");\n   extract_vertex_from_vbo(cmd->device);\n'
+    return re.sub(regex, repl, code)
 
-code = code.replace('return vk_command_buffer_end(&cmd_buffer->vk);', 'g_last_vbo_iova = 0;\n   return vk_command_buffer_end(&cmd_buffer->vk);')
+code = inject_draw(code, 'tu_CmdDraw', 'vertexCount')
+code = inject_draw(code, 'tu_CmdDrawIndexed', 'indexCount')
+code = inject_draw(code, 'tu_CmdDrawIndirect', '99999')
+code = inject_draw(code, 'tu_CmdDrawIndexedIndirect', '99999')
+code = inject_draw(code, 'tu_CmdDrawIndirectCount', '99999')
+code = inject_draw(code, 'tu_CmdDrawIndexedIndirectCount', '99999')
+
+# 5. 在 Dispatch (Compute) 中打桩
+regex_dispatch = r'(VKAPI_ATTR void VKAPI_CALL\ntu_CmdDispatchBase\([^)]+\)\n\{\n)'
+code = re.sub(regex_dispatch, r'\1   mesa_loge("ESP_HIT: tu_CmdDispatchBase called!");\n', code)
+
+# 6. 清理去重状态
+code = code.replace('return vk_command_buffer_end(&cmd_buffer->vk);', 'g_current_vbo_iova = 0;\n   return vk_command_buffer_end(&cmd_buffer->vk);')
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
@@ -183,10 +225,6 @@ EOF
 		-Dstrip=true \
 		-Degl=disabled &> "$workdir/meson_log"
 
-	if [ $? -ne 0 ]; then
-		echo -e "$red Meson setup failed! $nocolor" && exit 1
-	fi
-
 	ninja -C build-android-aarch64 &> "$workdir/ninja_log"
 
 	if ! [ -a "$workdir"/mesa-src/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
@@ -214,15 +252,16 @@ author=MrMiy4mo
 description=Turnip
 EOF
 
-	# 【核心修改】注入提权脚本 post-fs-data.sh
 	cat <<EOF >"$magiskdir/post-fs-data.sh"
 #!/system/bin/sh
-# 预创建文件并赋予最高权限，确保游戏进程能写
 touch /data/local/tmp/vulkan_dump.txt
 chmod 777 /data/local/tmp/vulkan_dump.txt
 chown 2000:2000 /data/local/tmp/vulkan_dump.txt
-# 改变 SELinux 上下文，允许普通应用写入
 chcon u:object_r:system_file:s0 /data/local/tmp/vulkan_dump.txt
+touch /storage/emulated/0/vulkan_dump.txt
+chmod 777 /storage/emulated/0/vulkan_dump.txt
+chown 2000:2000 /storage/emulated/0/vulkan_dump.txt
+chcon u:object_r:media_rw_data_file:s0 /storage/emulated/0/vulkan_dump.txt
 EOF
 	chmod +x "$magiskdir/post-fs-data.sh"
 
