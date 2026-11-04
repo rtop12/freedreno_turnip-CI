@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 VBO 专用探针...${nocolor}"
+    echo -e "${green}正在注入 严格进程过滤探针...${nocolor}"
     cat << 'PYEOF' > inject.py
 import re
 
@@ -67,30 +67,57 @@ global_code = '''
 #include <fcntl.h>
 
 static int g_is_game = -1; 
+static char g_proc_name[256] = {0};
+
 static bool is_game_process() {
     if (g_is_game != -1) return g_is_game == 1;
-    char buf[256] = {0};
+    
     int fd = open("/proc/self/cmdline", O_RDONLY);
     if (fd < 0) { g_is_game = 0; return false; }
-    read(fd, buf, sizeof(buf) - 1);
+    int len = read(fd, g_proc_name, sizeof(g_proc_name) - 1);
     close(fd);
-    g_is_game = (strstr(buf, "com.tencent.tmgp.dfm") != NULL) ? 1 : 0;
+    if (len > 0) g_proc_name[len] = '\\0';
+    
+    // 只要包含这个包名（主进程或子进程）就放行
+    g_is_game = (strstr(g_proc_name, "com.tencent.tmgp.dfm") != NULL) ? 1 : 0;
+    
+    // 打印一次，看看是谁在用
+    if (g_is_game) {
+        mesa_loge("ESP_LOCK: Game Process Detected: [%s]", g_proc_name);
+    }
     return g_is_game == 1;
 }
 
-// 专门用来解析并打印 VBO/IBO 里的前几个浮点数
-static void print_vbo_data(struct tu_device *device, uint64_t iova, uint32_t size, const char* type) {
-    if (iova == 0 || size == 0) return;
-    struct tu_bo *bo = tu_device_lookup_bo(device, iova);
-    if (bo && bo->map) {
-        // 越界保护
-        if (iova - bo->iova + 32 > bo->size) return; 
-        
-        // 读取前 32 字节（8 个 float）
-        float *vals = (float*)((char *)bo->map + (iova - bo->iova));
-        mesa_loge("ESP_VBO: %s IOVA: %" PRIx64 ", Size: %u", type, iova, size);
-        mesa_loge("ESP_VBO: %s Data: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", 
-                  type, vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
+// 强行拆包读取数据
+static void dump_state(struct tu_cmd_buffer *cmd) {
+    if (!is_game_process()) return;
+
+    // 极高阈值，保证不卡死
+    static uint32_t cnt = 0;
+    if (cnt++ % 3000 != 0) return; 
+
+    mesa_loge("ESP_LOCK: Draw Snapshot in [%s]", g_proc_name);
+    
+    // 1. 检查 VBO
+    if (cmd->state.vb[0].base) {
+        mesa_loge("ESP_LOCK: VBO IOVA: %" PRIx64, cmd->state.vb[0].base);
+    }
+    // 2. 检查 IBO
+    if (cmd->state.index_va) {
+        mesa_loge("ESP_LOCK: IBO IOVA: %" PRIx64, cmd->state.index_va);
+    }
+    // 3. 检查 DescBuffer (UE5 的新特性)
+    for (int i=0; i<8; i++) {
+        if (cmd->state.descriptor_buffer_iova[i]) {
+            mesa_loge("ESP_LOCK: DescBuf[%d] IOVA: %" PRIx64, i, cmd->state.descriptor_buffer_iova[i]);
+        }
+    }
+    // 4. 检查 DescSet
+    struct tu_descriptor_state *desc = &cmd->descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
+    for (int i=0; i<MAX_SETS; i++) {
+        if (desc->set_iova[i]) {
+            mesa_loge("ESP_LOCK: DescSet[%d] IOVA: %" PRIx64, i, desc->set_iova[i]);
+        }
     }
 }
 '''
@@ -98,30 +125,11 @@ static void print_vbo_data(struct tu_device *device, uint64_t iova, uint32_t siz
 # 1. 注入全局
 code = code.replace('enum tu_cmd_buffer_status {', global_code + '\nenum tu_cmd_buffer_status {')
 
-# 2. 拦截 BindVertexBuffers2 抢 VBO
-code = code.replace(
-    'cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
-    '''   if (is_game_process()) {
-       for (uint32_t i = 0; i < bindingCount; i++) {
-           if (cmd->state.vb[firstBinding + i].base != 0) {
-               print_vbo_data(cmd->device, cmd->state.vb[firstBinding + i].base, cmd->state.vb[firstBinding + i].size, "VBO");
-           }
-       }
-   }
-   cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;
-}\n''',
-    1
-)
-
-# 3. 拦截 BindIndexBuffer2KHR 抢 IBO (索引缓冲)
-code = code.replace(
-    'cmd->state.index_size = index_size;\n   } else {',
-    '''cmd->state.index_size = index_size;
-       if (is_game_process()) {
-           print_vbo_data(cmd->device, cmd->state.index_va, cmd->state.max_index_count * 2, "IBO");
-       }
-   } else {'''
-)
+# 2. 在 Draw 里调用
+code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 
+                    'dump_state(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
+code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 
+                    'dump_state(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
@@ -131,6 +139,7 @@ PYEOF
     rm inject.py
 }
 
+# 后面编译和打包代码保持不变...
 build_lib_for_android(){
 	mkdir -p "$workdir/bin"
 	ln -sf "$ndk/clang" "$workdir/bin/cc"
