@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 ESP Dump (修复版)...${nocolor}"
+    echo -e "${green}正在注入 进程过滤版 Descriptor Dump...${nocolor}"
     cat << 'PYEOF' > inject.py
 import re
 
@@ -63,91 +63,71 @@ with open(filepath, "r", encoding="utf-8") as f:
 global_code = '''
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 
-static float g_current_matrix[16] = {0};
-static uint64_t g_current_vbo_iova = 0;
-static uint32_t g_current_vbo_size = 0;
+// 判断当前是不是游戏进程
+static bool is_game_process() {
+    char buf[256];
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return false;
+    int len = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (len <= 0) return false;
+    buf[len] = '\\0';
+    // 包含游戏包名才返回 true
+    return strstr(buf, "com.tencent.tmgp.dfm") != NULL;
+}
 
-static void extract_vertex_and_dump(struct tu_device *device, const char* func, uint32_t count) {
-    mesa_loge("ESP_HIT: %s called!", func);
+static void dump_descriptors(struct tu_cmd_buffer *cmd) {
+    if (!is_game_process()) return;
+
+    const char* paths[] = {
+        "/storage/emulated/0/vulkan_dump.txt",
+        "/data/local/tmp/vulkan_dump.txt",
+        "/sdcard/vulkan_dump.txt"
+    };
     
-    if (g_current_vbo_iova == 0) return;
+    struct tu_descriptor_state *desc_state = &cmd->descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
     
-    struct tu_bo *bo = tu_device_lookup_bo(device, g_current_vbo_iova);
-    if (bo && bo->map) {
-        void *cpu_vbo_ptr = (void *)((char *)bo->map + (g_current_vbo_iova - bo->iova));
+    for (int i = 0; i < MAX_SETS; i++) {
+        uint64_t iova = desc_state->set_iova[i];
+        if (iova == 0) continue;
         
-        const char* paths[] = {
-            "/storage/emulated/0/vulkan_dump.txt",
-            "/data/local/tmp/vulkan_dump.txt",
-            "/sdcard/vulkan_dump.txt"
-        };
+        struct tu_bo *bo = tu_device_lookup_bo(cmd->device, iova);
+        if (!bo || !bo->map) continue;
+        
+        // 安全读取前 64 字节
+        void *ptr = (void *)((char *)bo->map + (iova - bo->iova));
+        float *vals = (float*)ptr;
+        
+        if (isnan(vals[0]) || isinf(vals[0])) continue;
         
         FILE *fp = NULL;
-        for (int i = 0; i < 3; i++) {
-            fp = fopen(paths[i], "a+");
+        for (int j = 0; j < 3; j++) {
+            fp = fopen(paths[j], "a+");
             if (fp) break;
         }
         
         if (fp) {
-            fprintf(fp, "=== HIT: %s ===\\n", func);
-            if (count > 0) fprintf(fp, "Count: %u\\n", count);
-            
-            bool not_zero = false;
-            for(int j=0; j<16; j++) if(g_current_matrix[j] != 0.0f) { not_zero = true; break; }
-            if (not_zero) {
-                fprintf(fp, "Matrix: ");
-                for (int j = 0; j < 16; j++) fprintf(fp, "%f ", g_current_matrix[j]);
-                fprintf(fp, "\\n");
-            }
-            
-            float* verts = (float*)cpu_vbo_ptr;
-            fprintf(fp, "Vertex: %f %f %f\\n\\n", verts[0], verts[1], verts[2]);
+            // 我们只打印疑似矩阵的前 4 个和最后 4 个数字（通常是平移向量）
+            fprintf(fp, "--- Draw (Set %d) ---\\n", i);
+            fprintf(fp, "Row0: %.4f %.4f %.4f %.4f\\n", vals[0], vals[1], vals[2], vals[3]);
+            fprintf(fp, "Row3: %.4f %.4f %.4f %.4f\\n", vals[12], vals[13], vals[14], vals[15]);
             fclose(fp);
         }
     }
 }
 '''
 
-# 1. 找最稳妥的锚点注入全局变量（enum tu_cmd_buffer_status 绝对存在）
+# 1. 注入全局变量
 code = code.replace('enum tu_cmd_buffer_status {', global_code + '\nenum tu_cmd_buffer_status {')
 
-# 2. 驱动加载确认
-code = code.replace('tu_cmd_buffer_status_gpu_write(cmd_buffer, TU_CMD_BUFFER_STATUS_ACTIVE);', 
-                    'mesa_loge("ESP_HIT: TURNIP DRIVER LOADED!");\n   tu_cmd_buffer_status_gpu_write(cmd_buffer, TU_CMD_BUFFER_STATUS_ACTIVE);')
-
-# 3. 截获 VBO (在 cmd 存在的作用域内)
-code = code.replace(
-    'cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
-    '''   if (bindingCount > 0) { 
-       g_current_vbo_iova = cmd->state.vb[firstBinding].base; 
-       g_current_vbo_size = cmd->state.vb[firstBinding].size; 
-   }
-   cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;
-}\n''',
-    1
-)
-
-# 4. 截获 PushConstants (矩阵)
-code = code.replace(
-    'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n}\nTU_GENX(tu_CmdPushConstants2KHR);',
-    '''cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
-   if (pPushConstantsInfo->size >= 64) {
-       memcpy(g_current_matrix, pPushConstantsInfo->pValues, 64);
-   }
-}
-TU_GENX(tu_CmdPushConstants2KHR);'''
-)
-
-# 5. 在 Draw 函数里打桩（直接替换 tu6_draw_common，这里 100% 有 cmd）
+# 2. 在 Draw 函数里调用
 code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 
-                    'extract_vertex_and_dump(cmd->device, "tu_CmdDraw", vertexCount);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
+                    'dump_descriptors(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
 code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 
-                    'extract_vertex_and_dump(cmd->device, "tu_CmdDrawIndexed", indexCount);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
-code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, 0);', 
-                    'extract_vertex_and_dump(cmd->device, "tu_CmdDrawIndirect", 99999);\n   tu6_draw_common<CHIP>(cmd, cs, false, 0);')
-code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, 0);', 
-                    'extract_vertex_and_dump(cmd->device, "tu_CmdDrawIndexedIndirect", 99999);\n   tu6_draw_common<CHIP>(cmd, cs, true, 0);')
+                    'dump_descriptors(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
@@ -239,13 +219,13 @@ EOF
 
 	cat <<EOF >"$magiskdir/post-fs-data.sh"
 #!/system/bin/sh
+rm -f /data/local/tmp/vulkan_dump.txt
+rm -f /storage/emulated/0/vulkan_dump.txt
 touch /data/local/tmp/vulkan_dump.txt
 chmod 777 /data/local/tmp/vulkan_dump.txt
-chown 2000:2000 /data/local/tmp/vulkan_dump.txt
 chcon u:object_r:system_file:s0 /data/local/tmp/vulkan_dump.txt
 touch /storage/emulated/0/vulkan_dump.txt
 chmod 777 /storage/emulated/0/vulkan_dump.txt
-chown 2000:2000 /storage/emulated/0/vulkan_dump.txt
 chcon u:object_r:media_rw_data_file:s0 /storage/emulated/0/vulkan_dump.txt
 EOF
 	chmod +x "$magiskdir/post-fs-data.sh"
