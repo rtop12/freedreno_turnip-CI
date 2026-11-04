@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/bin/bash
 
 #Define variables
 green='\033[0;32m'
@@ -12,7 +12,7 @@ ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
 sdkver="34"
 mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
 
-clear
+# 删除了 clear 防止出现 TERM 环境变量报错
 
 run_all(){
 	check_deps
@@ -25,20 +25,27 @@ run_all(){
 
 check_deps(){
 	echo "Checking system for required Dependencies ..."
-		for deps_chk in $deps;
-			do
-				sleep 0.25
-				if command -v "$deps_chk" >/dev/null 2>&1 ; then
-					echo -e "$green - $deps_chk found $nocolor"
-				else
-					echo -e "$red - $deps_chk not found, can't countinue. $nocolor"
-					deps_missing=1
-				fi;
-			done
+    
+    # ================= 自动安装缺失的依赖 =================
+    echo "Installing missing system tools (glslang-tools etc)..."
+    sudo apt-get update -qq
+    sudo apt-get install -y glslang-tools python3-pip zip unzip curl patchelf > /dev/null
+    # ====================================================
 
-		if [ "$deps_missing" == "1" ]
-			then echo "Please install missing dependencies" && exit 1
-		fi
+	for deps_chk in $deps;
+		do
+			sleep 0.25
+			if command -v "$deps_chk" >/dev/null 2>&1 ; then
+				echo -e "$green - $deps_chk found $nocolor"
+			else
+				echo -e "$red - $deps_chk not found, can't countinue. $nocolor"
+				deps_missing=1
+			fi;
+		done
+
+	if [ "$deps_missing" == "1" ]
+		then echo "Please install missing dependencies" && exit 1
+	fi
 
 	echo "Installing python Mako dependency (if missing) ..." $'\n'
 		pip install mako &> /dev/null
@@ -69,8 +76,8 @@ file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-# 1. 注入头文件 (加 freedreno_bo.h 防止指针报错)
-content = content.replace('#include \"tu_cmd_buffer.h\"', '#include \"tu_cmd_buffer.h\"\n#include \"freedreno_bo.h\"\n#include <stdio.h>\n#include <time.h>')
+# 1. 注入头文件
+content = content.replace('#include \"tu_cmd_buffer.h\"', '#include \"tu_cmd_buffer.h\"\n#include <stdio.h>\n#include <time.h>')
 
 # 2. 注入截获代码
 hook_code = '''
@@ -156,7 +163,7 @@ cpu = 'x86_64'
 endian = 'little'
 EOF
 
-	# 临时关闭 -e，防止 meson 报错直接杀掉脚本，我们要把日志打印出来
+	# 关闭 -e，防止报错直接退出，我们要打印日志
 	set +e
 	meson setup build-android-aarch64 \
 		--cross-file "android-aarch64.txt" \
