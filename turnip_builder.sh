@@ -4,15 +4,14 @@
 green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
-deps="meson ninja patchelf unzip curl pip flex bison zip glslang-tools"
+# 注意这里：把 glslang-tools 改成了 glslangValidator
+deps="meson ninja patchelf unzip curl pip flex bison zip glslangValidator"
 workdir="$(pwd)/turnip_workdir"
 magiskdir="$workdir/turnip_module"
 ndkver="android-ndk-r28"
 ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
 sdkver="34"
 mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
-
-# 删除了 clear 防止出现 TERM 环境变量报错
 
 run_all(){
 	check_deps
@@ -26,11 +25,11 @@ run_all(){
 check_deps(){
 	echo "Checking system for required Dependencies ..."
     
-    # ================= 自动安装缺失的依赖 =================
+    # 自动安装缺失的依赖
     echo "Installing missing system tools (glslang-tools etc)..."
     sudo apt-get update -qq
-    sudo apt-get install -y glslang-tools python3-pip zip unzip curl patchelf > /dev/null
-    # ====================================================
+    # 安装软件包 glslang-tools，它会提供 glslangValidator 命令
+    sudo apt-get install -y glslang-tools python3-pip zip unzip curl patchelf
 
 	for deps_chk in $deps;
 		do
@@ -117,7 +116,6 @@ with open(file_path, 'w') as f:
 # =======================================================
 
 build_lib_for_android(){
-	#Workaround for using Clang as c compiler instead of GCC
 	mkdir -p "$workdir/bin"
 	ln -sf "$ndk/clang" "$workdir/bin/cc"
 	ln -sf "$ndk/clang++" "$workdir/bin/c++"
@@ -163,7 +161,6 @@ cpu = 'x86_64'
 endian = 'little'
 EOF
 
-	# 关闭 -e，防止报错直接退出，我们要打印日志
 	set +e
 	meson setup build-android-aarch64 \
 		--cross-file "android-aarch64.txt" \
