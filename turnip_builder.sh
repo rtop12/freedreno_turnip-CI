@@ -4,7 +4,6 @@
 green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
-# 注意这里：把 glslang-tools 改成了 glslangValidator
 deps="meson ninja patchelf unzip curl pip flex bison zip glslangValidator"
 workdir="$(pwd)/turnip_workdir"
 magiskdir="$workdir/turnip_module"
@@ -24,11 +23,8 @@ run_all(){
 
 check_deps(){
 	echo "Checking system for required Dependencies ..."
-    
-    # 自动安装缺失的依赖
     echo "Installing missing system tools (glslang-tools etc)..."
     sudo apt-get update -qq
-    # 安装软件包 glslang-tools，它会提供 glslangValidator 命令
     sudo apt-get install -y glslang-tools python3-pip zip unzip curl patchelf
 
 	for deps_chk in $deps;
@@ -75,10 +71,8 @@ file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-# 1. 注入头文件
 content = content.replace('#include \"tu_cmd_buffer.h\"', '#include \"tu_cmd_buffer.h\"\n#include <stdio.h>\n#include <time.h>')
 
-# 2. 注入截获代码
 hook_code = '''
          if (buf && buf->bo) {
             static struct timespec last_time = {0, 0};
@@ -100,7 +94,6 @@ hook_code = '''
          }
 '''
 
-# 3. 强行把代码插进 tu_CmdBindVertexBuffers2 函数里
 target_str = 'struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);'
 if target_str in content:
     content = content.replace(target_str, target_str + '\n' + hook_code)
@@ -162,6 +155,7 @@ endian = 'little'
 EOF
 
 	set +e
+	# 【重点修改】删除了 -DVulkan-beta=true
 	meson setup build-android-aarch64 \
 		--cross-file "android-aarch64.txt" \
 		--native-file "native.txt" \
@@ -171,7 +165,6 @@ EOF
 		-Dandroid-stub=true \
 		-Dgallium-drivers= \
 		-Dvulkan-drivers=freedreno \
-		-DVulkan-beta=true \
 		-Dfreedreno-kmds=kgsl \
 		-Db_lto=true \
 		-Dstrip=true \
