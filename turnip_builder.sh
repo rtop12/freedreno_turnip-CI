@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Turnip Vulkan 驱动顶点明文提取构建脚本
+# Turnip Vulkan 驱动层 DrawCall 模型矩阵提取
 # ==========================================
 
 green='\033[0;32m'
@@ -48,13 +48,12 @@ prepare_workdir(){
     fi
 }
 
-# ================= 核心：暴力提取顶点明文 =================
+# ================= 核心：在绘制时抓取模型矩阵 =================
 inject_custom_code(){
-    echo -e "${green}[3/6] 注入顶点明文提取代码...${nocolor}"
+    echo -e "${green}[3/6] 注入 DrawCall 模型提取代码...${nocolor}"
     
     cat << 'PYEOF' > /tmp/inject.py
 import sys
-import re
 
 file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
@@ -64,86 +63,78 @@ with open(file_path, 'r') as f:
 if '#include <math.h>' not in content:
     content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <math.h>')
 
-# ================= 拦截 1：抓取顶点缓冲区的真实明文数据 =================
-vb_hook_code = r'''
-   // ======== 提取 Vertex Buffer 裸数据 ========
-   static long last_vb_sec = 0;
-   struct timespec now_vb;
-   clock_gettime(CLOCK_MONOTONIC, &now_vb);
-
-   // 限制 1 秒写一次，防止卡死手机
-   if (now_vb.tv_sec != last_vb_sec) {
-       last_vb_sec = now_vb.tv_sec;
+# ================= 拦截 tu_CmdDrawIndexed =================
+draw_hook_code = r'''
+   // ======== 提取 DrawCall 时的模型矩阵 ========
+   static long last_draw_sec = 0;
+   struct timespec now_draw;
+   clock_gettime(CLOCK_MONOTONIC, &now_draw);
+   
+   // 限制频率，防止卡顿（这里为了不漏数据，改成 0.5 秒抓一次，也就是每两帧抓一次）
+   // 你可以根据实际情况调整，比如去掉 if 限制直接抓
+   if (now_draw.tv_sec != last_draw_sec && indexCount > 1000) {
+       last_draw_sec = now_draw.tv_sec;
        
-       for (uint32_t i = 0; i < bindingCount; i++) {
-           if (pBuffers[i] != VK_NULL_HANDLE) {
-               VK_FROM_HANDLE(tu_buffer, buf, pBuffers[i]);
-               if (buf && buf->bo) {
-                   // 只抓取比较大的 Buffer，过滤掉 UI 小模型
-                   if (buf->vk.size > 20000) {
-                       FILE *fp = fopen("/sdcard/ue4_vertex_dump.txt", "a");
-                       if (fp) {
-                           fprintf(fp, "\n[VB] Size: %llu | IOVA: 0x%llx | map: %p\n", 
-                                   (unsigned long long)buf->vk.size, 
-                                   (unsigned long long)buf->bo->iova, 
-                                   buf->bo->map);
+       FILE *fp = fopen("/sdcard/ue4_models.txt", "a");
+       if (fp) {
+           fprintf(fp, "\n[DrawIndexed] IndexCount: %u | InstanceCount: %u\n", indexCount, instanceCount);
+           
+           // 1. 检查当前绑定的描述符集 (通常存放模型矩阵)
+           struct tu_descriptor_state *desc_state = &cmd->state.descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
+           
+           for (uint32_t s = 0; s < desc_state->max_sets_bound; s++) {
+               struct tu_descriptor_set *set = desc_state->sets[s];
+               if (!set) continue;
+               
+               for (uint32_t b = 0; b < set->layout->binding_count; b++) {
+                   struct tu_descriptor_set_binding_layout *binding = &set->layout->binding[b];
+                   
+                   if (binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || 
+                       binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                       
+                       // 如果这块 UBO/SSBO 的 CPU 映射指针存在，直接读！
+                       if (set->mapped_ptr) {
+                           float *data = (float *)((char*)set->mapped_ptr + binding->offset);
                            
-                           // 如果 CPU 可以直接读（Host Visible），直接 dump 前 200 个 float 看看
-                           // 注意：如果是纯显存，map 会为 null，此时强行读会闪退！
-                           if (buf->bo->map) {
-                               float *data = (float *)buf->bo->map;
-                               int dump_count = (buf->vk.size / 4 < 200) ? (buf->vk.size / 4) : 200;
-                               for (int k = 0; k < dump_count; k++) {
-                                   // 过滤掉 NaN 和天文数字
-                                   if (isfinite(data[k]) && fabs(data[k]) < 100000.0f) {
-                                       fprintf(fp, "%10.3f ", data[k]);
-                                   } else {
-                                       fprintf(fp, "  [BUF]  ");
-                                   }
-                                   if ((k+1) % 4 == 0) fprintf(fp, "\n");
+                           // 尝试寻找浮点矩阵的平移分量（打印前几个矩阵看看）
+                           fprintf(fp, "  Set[%u] Bind[%u] Data:\n", s, b);
+                           for (int k = 0; k < 16; k++) {
+                               if (isfinite(data[k]) && fabs(data[k]) < 100000.0f) {
+                                   fprintf(fp, "%8.2f ", data[k]);
+                               } else {
+                                   fprintf(fp, " [BUF]  ");
                                }
-                               fprintf(fp, "\n");
+                               if ((k + 1) % 4 == 0) fprintf(fp, "\n");
                            }
-                           fclose(fp);
                        }
                    }
                }
            }
-       }
-   }
-'''
-target_vb = 'tu_CmdBindVertexBuffers2('
-start_idx = content.find(target_vb)
-if start_idx != -1:
-    brace_idx = content.find('{', start_idx)
-    content = content[:brace_idx+1] + vb_hook_code + content[brace_idx+1:]
-    print('✅ VertexBuffer 注入成功！')
-
-# ================= 拦截 2：记录绘制特征，辅助定位敌人 =================
-draw_hook_code = r'''
-   // ======== 记录 DrawCall 特征 ========
-   static long last_draw_sec = 0;
-   struct timespec now_draw;
-   clock_gettime(CLOCK_MONOTONIC, &now_draw);
-
-   if (now_draw.tv_sec != last_draw_sec) {
-       last_draw_sec = now_draw.tv_sec;
-       // 人物模型通常在 1000 ~ 50000 个索引之间
-       if (indexCount > 1000 && indexCount < 100000) {
-           FILE *fp = fopen("/sdcard/ue4_draw_dump.txt", "a");
-           if (fp) {
-               fprintf(fp, "DrawCall -> IndexCount: %u | InstanceCount: %u\n", indexCount, instanceCount);
-               fclose(fp);
+           
+           // 2. 检查顶点实例缓冲 (如果使用了 Instance Rendering，坐标可能在 Vertex Buffer 里)
+           // cmd->state.vb 包含了当前绑定的所有 Vertex Buffer
+           for (int i = 0; i < cmd->state.max_vbs_bound; i++) {
+               if (cmd->state.vb[i].base != 0) {
+                   // 这里的 base 是 IOVA，我们不能直接读。但如果是 Host Visible 的，前面已经读过了。
+                   // 打印一下看看大小，区分它是网格还是实例数据
+                   // fprintf(fp, "  VB[%d] Base: 0x%llx\n", i, cmd->state.vb[i].base);
+               }
            }
+           
+           fclose(fp);
        }
    }
 '''
+
+# 寻找 tu_CmdDrawIndexed
 target_draw = 'tu_CmdDrawIndexed('
 start_idx = content.find(target_draw)
 if start_idx != -1:
     brace_idx = content.find('{', start_idx)
     content = content[:brace_idx+1] + draw_hook_code + content[brace_idx+1:]
-    print('✅ DrawCall 注入成功！')
+    print('✅ CmdDrawIndexed 模型矩阵注入成功！')
+else:
+    print('❌ 找不到 tu_CmdDrawIndexed')
 
 with open(file_path, 'w') as f:
     f.write(content)
@@ -235,7 +226,7 @@ name=Turnip Hook
 version=1.0
 versionCode=1
 author=You
-description=Custom Turnip Vertex Hook
+description=Custom Turnip Model Hook
 EOF
     cat <<EOF >"customize.sh"
 set_perm_recursive \$MODPATH/system 0 0 755 u:object_r:system_file:s0
