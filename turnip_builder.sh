@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 安全探针版（防死机）...${nocolor}"
+    echo -e "${green}正在注入 VBO 专用探针...${nocolor}"
     cat << 'PYEOF' > inject.py
 import re
 
@@ -66,10 +66,6 @@ global_code = '''
 #include <unistd.h>
 #include <fcntl.h>
 
-static float g_current_matrix[16] = {0};
-static uint64_t g_saved_desc_iova[MAX_SETS] = {0};
-
-// 只在初始化时读取一次进程名，避免频繁 IO
 static int g_is_game = -1; 
 static bool is_game_process() {
     if (g_is_game != -1) return g_is_game == 1;
@@ -81,41 +77,50 @@ static bool is_game_process() {
     g_is_game = (strstr(buf, "com.tencent.tmgp.dfm") != NULL) ? 1 : 0;
     return g_is_game == 1;
 }
+
+// 专门用来解析并打印 VBO/IBO 里的前几个浮点数
+static void print_vbo_data(struct tu_device *device, uint64_t iova, uint32_t size, const char* type) {
+    if (iova == 0 || size == 0) return;
+    struct tu_bo *bo = tu_device_lookup_bo(device, iova);
+    if (bo && bo->map) {
+        // 越界保护
+        if (iova - bo->iova + 32 > bo->size) return; 
+        
+        // 读取前 32 字节（8 个 float）
+        float *vals = (float*)((char *)bo->map + (iova - bo->iova));
+        mesa_loge("ESP_VBO: %s IOVA: %" PRIx64 ", Size: %u", type, iova, size);
+        mesa_loge("ESP_VBO: %s Data: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", 
+                  type, vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
+    }
+}
 '''
 
 # 1. 注入全局
 code = code.replace('enum tu_cmd_buffer_status {', global_code + '\nenum tu_cmd_buffer_status {')
 
-# 2. 截获矩阵并打印 (这个函数频率很低，不会卡死)
+# 2. 拦截 BindVertexBuffers2 抢 VBO
 code = code.replace(
-    'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n}\nTU_GENX(tu_CmdPushConstants2KHR);',
-    '''cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
-   if (pPushConstantsInfo->size >= 64) {
-       memcpy(g_current_matrix, pPushConstantsInfo->pValues, 64);
-       if (is_game_process()) {
-           mesa_loge("ESP_SAFE: PushConstants Matrix: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", 
-                     g_current_matrix[0], g_current_matrix[1], g_current_matrix[2], g_current_matrix[3],
-                     g_current_matrix[12], g_current_matrix[13], g_current_matrix[14], g_current_matrix[15]);
+    'cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
+    '''   if (is_game_process()) {
+       for (uint32_t i = 0; i < bindingCount; i++) {
+           if (cmd->state.vb[firstBinding + i].base != 0) {
+               print_vbo_data(cmd->device, cmd->state.vb[firstBinding + i].base, cmd->state.vb[firstBinding + i].size, "VBO");
+           }
        }
    }
-}
-TU_GENX(tu_CmdPushConstants2KHR);'''
+   cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;
+}\n''',
+    1
 )
 
-# 3. 截获 Descriptor 并打一次日志（频率也不高）
+# 3. 拦截 BindIndexBuffer2KHR 抢 IBO (索引缓冲)
 code = code.replace(
-    'descriptors_state->set_iova[idx] = set ? (set->va | BINDLESS_DESCRIPTOR_64B) : 0;',
-    '''descriptors_state->set_iova[idx] = set ? (set->va | BINDLESS_DESCRIPTOR_64B) : 0;
-       if (set && idx < MAX_SETS) {
-           g_saved_desc_iova[idx] = set->va;
-           if (is_game_process() && idx == 0) {
-               struct tu_bo *bo = tu_device_lookup_bo(cmd->device, set->va);
-               if (bo && bo->map) {
-                   float *vals = (float*)((char *)bo->map + (set->va - bo->iova));
-                   mesa_loge("ESP_SAFE: Desc[0] %.2f %.2f %.2f %.2f", vals[0], vals[1], vals[2], vals[3]);
-               }
-           }
-       }'''
+    'cmd->state.index_size = index_size;\n   } else {',
+    '''cmd->state.index_size = index_size;
+       if (is_game_process()) {
+           print_vbo_data(cmd->device, cmd->state.index_va, cmd->state.max_index_count * 2, "IBO");
+       }
+   } else {'''
 )
 
 with open(filepath, "w", encoding="utf-8") as f:
