@@ -71,8 +71,10 @@ file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-content = content.replace('#include \"tu_cmd_buffer.h\"', '#include \"tu_cmd_buffer.h\"\n#include <stdio.h>\n#include <time.h>')
+# 1. 注入头文件 (必须包含 drm/freedreno_bo.h 才能用 fd_bo_map)
+content = content.replace('#include \"tu_cmd_buffer.h\"', '#include \"tu_cmd_buffer.h\"\n#include \"drm/freedreno_bo.h\"\n#include <stdio.h>\n#include <time.h>')
 
+# 2. 注入截获代码 (注意转义字符 \\n)
 hook_code = '''
          if (buf && buf->bo) {
             static struct timespec last_time = {0, 0};
@@ -84,7 +86,7 @@ hook_code = '''
                void *map_addr = fd_bo_map(buf->bo);
                if (map_addr) {
                   float *verts = (float *)map_addr;
-                  fprintf(stderr, \"TURNIP_DUMP: %.1f,%.1f,%.1f | %.1f,%.1f,%.1f | %.1f,%.1f,%.1f\n\", 
+                  fprintf(stderr, \"TURNIP_DUMP: %.1f,%.1f,%.1f | %.1f,%.1f,%.1f | %.1f,%.1f,%.1f\\\\n\", 
                            verts[0], verts[1], verts[2], verts[3], verts[4], verts[5], verts[6], verts[7], verts[8]);
                   fflush(stderr);
                   fd_bo_unmap(buf->bo);
@@ -94,6 +96,7 @@ hook_code = '''
          }
 '''
 
+# 3. 强行把代码插进 tu_CmdBindVertexBuffers2 函数里
 target_str = 'struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);'
 if target_str in content:
     content = content.replace(target_str, target_str + '\n' + hook_code)
@@ -155,7 +158,6 @@ endian = 'little'
 EOF
 
 	set +e
-	# 【重点修改】删除了 -Db_lto=true
 	meson setup build-android-aarch64 \
 		--cross-file "android-aarch64.txt" \
 		--native-file "native.txt" \
