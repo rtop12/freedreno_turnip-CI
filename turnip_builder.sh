@@ -12,8 +12,8 @@ ndkver="android-ndk-r28"
 ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
 sdkver="34"
 mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
-
 REPO_ROOT="$(pwd)"
+
 clear
 
 run_all(){
@@ -56,16 +56,11 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
     
-    # ==========================================
-    # 核心：把最新的官方原版 tu_cmd_buffer.cc 提取出来！
-    # ==========================================
     echo -e "${green}提取纯净版 tu_cmd_buffer.cc 中...${nocolor}"
     cp src/freedreno/vulkan/tu_cmd_buffer.cc "$workdir/tu_cmd_buffer_original.cc"
     cd "$workdir"
     zip -q original_tu_cmd_buffer.zip tu_cmd_buffer_original.cc
-    echo -e "${green}纯净版已打包至: $workdir/original_tu_cmd_buffer.zip${nocolor}"
     cd mesa-src
-    # ==========================================
 
 	if [ -f "$REPO_ROOT/tu_cmd_buffer.cc" ]; then
 		echo -e "${green}Found custom tu_cmd_buffer.cc, applying patch ...${nocolor}" $'\n'
