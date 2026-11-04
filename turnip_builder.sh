@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# ==========================================
+# Turnip Vulkan 驱动底层坐标拦截构建脚本 (暴力明文版)
+# ==========================================
+
 green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
@@ -17,15 +21,22 @@ run_all(){
     build_lib_for_android
     port_lib_for_magisk
     port_lib_for_adrenotools
+    echo -e "${green}======================================${nocolor}"
+    echo -e "${green}编译完成！${nocolor}"
+    echo -e "${green}Magisk 模块: $workdir/turnip_magisk.zip${nocolor}"
+    echo -e "${green}AdrenoTools 驱动: $workdir/turnip_adrenotools.zip${nocolor}"
+    echo -e "${green}======================================${nocolor}"
 }
 
 check_deps(){
+    echo -e "${green}[1/6] 检查依赖...${nocolor}"
     sudo apt-get update -qq
     sudo apt-get install -y glslang-tools python3-pip zip unzip curl patchelf ccache
     pip install mako &> /dev/null
 }
 
 prepare_workdir(){
+    echo -e "${green}[2/6] 准备源码...${nocolor}"
     mkdir -p "$workdir" && cd "$_"
     if [ ! -d "$ndkver" ]; then
         curl -L https://dl.google.com/android/repository/"$ndkver"-linux.zip --output "$ndkver"-linux.zip &> /dev/null
@@ -37,9 +48,9 @@ prepare_workdir(){
     fi
 }
 
-# ================= 核心：注入 C++ 拦截代码 =================
+# ================= 核心：暴力提取明文浮点数 =================
 inject_custom_code(){
-    echo -e "${green}[3/6] 正在注入底层矩阵拦截代码...${nocolor}"
+    echo -e "${green}[3/6] 注入暴力明文提取代码...${nocolor}"
     
     cat << 'PYEOF' > /tmp/inject.py
 import sys
@@ -49,13 +60,13 @@ file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-# 补齐必要的头文件
+# 补齐头文件
 if '#include <math.h>' not in content:
     content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <math.h>')
 
-# ================= 拦截 1：Push Constants (主要抓相机/角色矩阵明文) =================
+# ================= 1. 拦截 PushConstants，暴力打印全部浮点数 =================
 push_hook_code = r'''
-   // ======== 拦截 PushConstants 提取矩阵明文 ========
+   // ======== 暴力打印 PushConstants 浮点数据 ========
    static long last_pc_sec = 0;
    struct timespec now_pc;
    clock_gettime(CLOCK_MONOTONIC, &now_pc);
@@ -63,22 +74,19 @@ push_hook_code = r'''
    if (now_pc.tv_sec != last_pc_sec) {
        last_pc_sec = now_pc.tv_sec;
        
-       if (pPushConstantsInfo->size >= 64) {
-           FILE *fp = fopen("/sdcard/ue4_plaintext.txt", "a");
+       if (pPushConstantsInfo->size >= 16) {
+           FILE *fp = fopen("/sdcard/ue4_dump.txt", "a");
            if (fp) {
                float *m = (float *)pPushConstantsInfo->pValues;
-               int count = pPushConstantsInfo->size / 64;
-               fprintf(fp, "\n=== PushConstants Matrix (Size: %u) ===\n", pPushConstantsInfo->size);
+               int count = pPushConstantsInfo->size / 4; // 多少个 float
+               fprintf(fp, "\n[PushConstants] Size: %u bytes (%d floats)\n", pPushConstantsInfo->size, count);
                
+               // 每 4 个 float 换一行（方便查看矩阵）
                for (int i = 0; i < count; i++) {
-                   float* mat = m + (i * 16);
-                   // 检查有效性：检查第 15 个元素是否为 1.0 左右，过滤垃圾数据
-                   if (isfinite(mat[12]) && isfinite(mat[13]) && isfinite(mat[14]) && isfinite(mat[15])) {
-                       if (fabs(mat[15] - 1.0f) < 0.1f && fabs(mat[12]) < 100000.0f) {
-                           fprintf(fp, "  Mat[%d] Pos -> X: %10.3f | Y: %10.3f | Z: %10.3f\n", i, mat[12], mat[13], mat[14]);
-                       }
-                   }
+                   fprintf(fp, "%10.3f ", m[i]);
+                   if ((i + 1) % 4 == 0) fprintf(fp, "\n");
                }
+               if (count % 4 != 0) fprintf(fp, "\n");
                fclose(fp);
            }
        }
@@ -89,12 +97,11 @@ start_idx = content.find(target_push)
 if start_idx != -1:
     brace_idx = content.find('{', start_idx)
     content = content[:brace_idx+1] + push_hook_code + content[brace_idx+1:]
-    print('✅ PushConstants 注入成功！')
+    print('✅ PushConstants 暴力注入成功！')
 
-# ================= 拦截 2：DescriptorSets (修正编译报错，只打印 IOVA 地址) =================
-# 注意：这里只能打印显存地址，不能直接读明文，因为描述符里存的是指针！
+# ================= 2. 拦截 DescriptorSets，暴力打印 UBO/SSBO 地址 =================
 desc_hook_code = r'''
-   // ======== 拦截 DescriptorSets 获取 UBO IOVA 地址 ========
+   // ======== 暴力打印 DescriptorSets Buffer 地址 ========
    static long last_desc_sec = 0;
    struct timespec now_desc;
    clock_gettime(CLOCK_MONOTONIC, &now_desc);
@@ -102,29 +109,37 @@ desc_hook_code = r'''
    if (now_desc.tv_sec != last_desc_sec) {
        last_desc_sec = now_desc.tv_sec;
        
-       // 修正 API 变量名：使用 pBindDescriptorSetsInfo 结构体
        const VkBindDescriptorSetsInfoKHR *info = pBindDescriptorSetsInfo;
-       if (info && info->descriptorSetCount > 0 && info->pDescriptorSets != NULL) {
-           FILE *fp = fopen("/sdcard/ue4_plaintext.txt", "a");
+       if (info && info->descriptorSetCount > 0) {
+           FILE *fp = fopen("/sdcard/ue4_dump.txt", "a");
            if (fp) {
-               fprintf(fp, "\n=== DescriptorSet UBO Info ===\n");
+               int found = 0;
                for (uint32_t s = 0; s < info->descriptorSetCount; s++) {
-                   // 修正宏调用
                    VK_FROM_HANDLE(tu_descriptor_set, set, info->pDescriptorSets[s]);
                    if (!set || !set->mapped_ptr) continue;
                    
                    for (uint32_t i = 0; i < set->layout->binding_count; i++) {
                        struct tu_descriptor_set_binding_layout *binding = &set->layout->binding[i];
+                       
+                       // 只要 Uniform Buffer 或 Storage Buffer
                        if (binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || 
-                           binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+                           binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                           binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+                           binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
                            
-                           // 描述符内存中存的是 64 位显存地址 (IOVA)
+                           if (!found) {
+                               fprintf(fp, "\n[DescriptorSet Buffer Bindings]\n");
+                               found = 1;
+                           }
+                           // 打印出这块 Buffer 的显存地址 (IOVA)
                            uint64_t iova = *((uint64_t*)((char*)set->mapped_ptr + binding->offset));
-                           fprintf(fp, "  Set[%u] Bind[%u] UBO IOVA: 0x%llx\n", s, i, (unsigned long long)iova);
+                           fprintf(fp, "  Set[%u] Binding[%u] Type: %u | Size: %u | IOVA: 0x%llx\n", 
+                                   s, i, binding->type, binding->size, (unsigned long long)iova);
                        }
                    }
                }
-               fclose(fp);
+               if (found) fclose(fp);
+               else fclose(fp);
            }
        }
    }
@@ -134,7 +149,7 @@ start_idx = content.find(target_desc)
 if start_idx != -1:
     brace_idx = content.find('{', start_idx)
     content = content[:brace_idx+1] + desc_hook_code + content[brace_idx+1:]
-    print('✅ DescriptorSets 注入成功（已修正变量名）！')
+    print('✅ DescriptorSets 地址注入成功！')
 
 with open(file_path, 'w') as f:
     f.write(content)
@@ -146,7 +161,7 @@ PYEOF
 }
 
 build_lib_for_android(){
-    echo -e "${green}[4/6] 开始 Meson/Ninja 编译...${nocolor}"
+    echo -e "${green}[4/6] 编译驱动...${nocolor}"
     cd "$workdir/mesa-main"
     
     mkdir -p "$workdir/bin"
@@ -226,7 +241,7 @@ name=Turnip Hook
 version=1.0
 versionCode=1
 author=You
-description=Custom Turnip with UE4 matrix hook
+description=Custom Turnip Hook
 EOF
     cat <<EOF >"customize.sh"
 set_perm_recursive \$MODPATH/system 0 0 755 u:object_r:system_file:s0
