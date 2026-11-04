@@ -14,8 +14,6 @@ mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
 
 clear
 
-#There are 4 functions here, simply comment to disable.
-#You can insert your own function and make a pull request.
 run_all(){
 	check_deps
 	prepare_workdir
@@ -66,7 +64,6 @@ inject_dump_code(){
 	echo "Injecting DUMP code into tu_cmd_buffer.cc ..." $'\n'
 	cd "$workdir/mesa-main/src/freedreno/vulkan"
 	
-	# 使用 Python 脚本进行精准文本替换
 	python3 - <<'PYEOF'
 import sys
 
@@ -77,11 +74,10 @@ with open(file_path, "r", encoding="utf-8") as f:
 def safe_replace(content, anchor, code, name):
     if anchor not in content:
         print(f"ERROR: Could not find anchor for {name}!")
-        print(f"Expected anchor: {anchor}")
         sys.exit(1)
     return content.replace(anchor, code + "\n" + anchor, 1)
 
-# 1. 注入全局变量和结构体 (注意这里路径改为了 /sdcard/)
+# 1. 注入全局变量和结构体
 header_code = """
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,7 +100,6 @@ struct DumpHeader {
 
 static inline void tu_dump_init() {
     if (!g_dump_file) {
-        // 改为了 /sdcard/ 根目录
         g_dump_file = fopen("/sdcard/turnip_dump.bin", "wb");
     }
 }
@@ -132,7 +127,7 @@ vbo_code = """
 anchor_vbo = "cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;"
 content = safe_replace(content, anchor_vbo, vbo_code, "VBO Mapping")
 
-# 3. 注入 Push Constants 截取
+# 3. 注入 Push Constants 截取 (修正了锚点，防止注入到错误函数)
 push_code = """
    /* === 插入 Push Constants 截取开始 === */
    if (g_draw_count < MAX_DUMP_DRAWS) {
@@ -147,7 +142,8 @@ push_code = """
    }
    /* === 插入 Push Constants 截取结束 === */
 """
-anchor_push = "cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;"
+# 这个锚点只存在于 tu_CmdPushConstants2KHR 中
+anchor_push = "pPushConstantsInfo->pValues, pPushConstantsInfo->size);"
 content = safe_replace(content, anchor_push, push_code, "Push Constants")
 
 # 4. 注入 Draw 截取
@@ -208,7 +204,6 @@ PYEOF
 }
 
 build_lib_for_android(){
-	#Workaround for using Clang as c compiler instead of GCC
 	mkdir -p "$workdir/bin"
 	ln -sf "$ndk/clang" "$workdir/bin/cc"
 	ln -sf "$ndk/clang++" "$workdir/bin/c++"
