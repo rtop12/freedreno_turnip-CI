@@ -14,7 +14,6 @@
 #include "vk_render_pass.h"
 #include "vk_util.h"
 
-
 #include "tu_clear_blit.h"
 #include "tu_cs.h"
 
@@ -22,11 +21,6 @@
 #include "tu_knl.h"
 
 #include "tu_tracepoints.h"
-
-
-#include "common/freedreno_gpu_event.h"
-#include "common/freedreno_lrz.h"
-#include "common/freedreno_vrs.h"
 
 #include <stdio.h>
 #include <string.h>
