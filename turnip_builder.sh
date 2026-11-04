@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 进程过滤版 Descriptor Dump...${nocolor}"
+    echo -e "${green}正在注入 全通道探针...${nocolor}"
     cat << 'PYEOF' > inject.py
 import re
 
@@ -63,71 +63,90 @@ with open(filepath, "r", encoding="utf-8") as f:
 global_code = '''
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
 
-// 判断当前是不是游戏进程
-static bool is_game_process() {
-    char buf[256];
-    int fd = open("/proc/self/cmdline", O_RDONLY);
-    if (fd < 0) return false;
-    int len = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (len <= 0) return false;
-    buf[len] = '\\0';
-    // 包含游戏包名才返回 true
-    return strstr(buf, "com.tencent.tmgp.dfm") != NULL;
-}
+static float g_current_matrix[16] = {0};
+static uint64_t g_current_vbo_iova = 0;
+static uint32_t g_current_vbo_size = 0;
+static uint64_t g_saved_desc_iova[MAX_SETS] = {0};
 
-static void dump_descriptors(struct tu_cmd_buffer *cmd) {
-    if (!is_game_process()) return;
+static void log_all_data(struct tu_cmd_buffer *cmd, const char* func_name, uint32_t count) {
+    static uint32_t dump_cnt = 0;
+    if (dump_cnt++ % 200 != 0) return; 
 
-    const char* paths[] = {
-        "/storage/emulated/0/vulkan_dump.txt",
-        "/data/local/tmp/vulkan_dump.txt",
-        "/sdcard/vulkan_dump.txt"
-    };
+    mesa_loge("ESP_ALL: --- %s (Count: %u) ---", func_name, count);
     
-    struct tu_descriptor_state *desc_state = &cmd->descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
-    
-    for (int i = 0; i < MAX_SETS; i++) {
-        uint64_t iova = desc_state->set_iova[i];
-        if (iova == 0) continue;
-        
-        struct tu_bo *bo = tu_device_lookup_bo(cmd->device, iova);
-        if (!bo || !bo->map) continue;
-        
-        // 安全读取前 64 字节
-        void *ptr = (void *)((char *)bo->map + (iova - bo->iova));
-        float *vals = (float*)ptr;
-        
-        if (isnan(vals[0]) || isinf(vals[0])) continue;
-        
-        FILE *fp = NULL;
-        for (int j = 0; j < 3; j++) {
-            fp = fopen(paths[j], "a+");
-            if (fp) break;
+    bool has_mat = false;
+    for(int i=0; i<16; i++) if(g_current_matrix[i] != 0.0f) { has_mat = true; break; }
+    if (has_mat) {
+        mesa_loge("ESP_ALL: Matrix: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", 
+              g_current_matrix[0], g_current_matrix[1], g_current_matrix[2], g_current_matrix[3],
+              g_current_matrix[12], g_current_matrix[13], g_current_matrix[14], g_current_matrix[15]);
+    }
+
+    // 如果抓到了传统 VBO
+    if (g_current_vbo_iova != 0) {
+        struct tu_bo *bo = tu_device_lookup_bo(cmd->device, g_current_vbo_iova);
+        if (bo && bo->map) {
+            float *vals = (float*)((char *)bo->map + (g_current_vbo_iova - bo->iova));
+            mesa_loge("ESP_ALL: VBO Data: %.2f %.2f %.2f | %.2f %.2f %.2f", 
+                      vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]);
         }
-        
-        if (fp) {
-            // 我们只打印疑似矩阵的前 4 个和最后 4 个数字（通常是平移向量）
-            fprintf(fp, "--- Draw (Set %d) ---\\n", i);
-            fprintf(fp, "Row0: %.4f %.4f %.4f %.4f\\n", vals[0], vals[1], vals[2], vals[3]);
-            fprintf(fp, "Row3: %.4f %.4f %.4f %.4f\\n", vals[12], vals[13], vals[14], vals[15]);
-            fclose(fp);
+    }
+
+    // 如果抓到了 Descriptor Buffer
+    for (int i=0; i<MAX_SETS; i++) {
+        if (g_saved_desc_iova[i] == 0) continue;
+        struct tu_bo *bo = tu_device_lookup_bo(cmd->device, g_saved_desc_iova[i]);
+        if (bo && bo->map) {
+            float *vals = (float*)((char *)bo->map + (g_saved_desc_iova[i] - bo->iova));
+            // 只打印前 6 个 float 看看是不是坐标
+            mesa_loge("ESP_ALL: Desc[%d] Data: %.2f %.2f %.2f | %.2f %.2f %.2f", 
+                      i, vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]);
         }
     }
 }
 '''
 
-# 1. 注入全局变量
+# 1. 注入全局
 code = code.replace('enum tu_cmd_buffer_status {', global_code + '\nenum tu_cmd_buffer_status {')
 
-# 2. 在 Draw 函数里调用
+# 2. 截获矩阵
+code = code.replace(
+    'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n}\nTU_GENX(tu_CmdPushConstants2KHR);',
+    '''cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
+   if (pPushConstantsInfo->size >= 64) {
+       memcpy(g_current_matrix, pPushConstantsInfo->pValues, 64);
+   }
+}
+TU_GENX(tu_CmdPushConstants2KHR);'''
+)
+
+# 3. 截获 VBO
+code = code.replace(
+    'cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
+    '''   if (bindingCount > 0) { 
+       g_current_vbo_iova = cmd->state.vb[firstBinding].base; 
+       g_current_vbo_size = cmd->state.vb[firstBinding].size; 
+   }
+   cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;
+}\n''',
+    1
+)
+
+# 4. 截获 Descriptor Sets (关键！)
+code = code.replace(
+    'descriptors_state->set_iova[idx] = set ? (set->va | BINDLESS_DESCRIPTOR_64B) : 0;',
+    '''descriptors_state->set_iova[idx] = set ? (set->va | BINDLESS_DESCRIPTOR_64B) : 0;
+       if (set && idx < MAX_SETS) {
+           g_saved_desc_iova[idx] = set->va;
+       }'''
+)
+
+# 5. 在 Draw 里打印
 code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 
-                    'dump_descriptors(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
+                    'log_all_data(cmd, "tu_CmdDraw", vertexCount);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
 code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 
-                    'dump_descriptors(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
+                    'log_all_data(cmd, "tu_CmdDrawIndexed", indexCount);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
@@ -215,26 +234,6 @@ version=$(cat $workdir/mesa-src/VERSION)
 versionCode=1
 author=MrMiy4mo
 description=Turnip
-EOF
-
-	cat <<EOF >"$magiskdir/post-fs-data.sh"
-#!/system/bin/sh
-rm -f /data/local/tmp/vulkan_dump.txt
-rm -f /storage/emulated/0/vulkan_dump.txt
-touch /data/local/tmp/vulkan_dump.txt
-chmod 777 /data/local/tmp/vulkan_dump.txt
-chcon u:object_r:system_file:s0 /data/local/tmp/vulkan_dump.txt
-touch /storage/emulated/0/vulkan_dump.txt
-chmod 777 /storage/emulated/0/vulkan_dump.txt
-chcon u:object_r:media_rw_data_file:s0 /storage/emulated/0/vulkan_dump.txt
-EOF
-	chmod +x "$magiskdir/post-fs-data.sh"
-
-	cat <<EOF >"$magiskdir/customize.sh"
-set_perm_recursive \$MODPATH/system 0 0 755 u:object_r:system_file:s0
-set_perm_recursive \$MODPATH/system/vendor 0 2000 755 u:object_r:vendor_file:s0
-set_perm \$MODPATH/$p1/vulkan.adreno.so 0 0 0644 u:object_r:same_process_hal_file:s0
-set_perm \$MODPATH/post-fs-data.sh 0 0 0755 u:object_r:system_file:s0
 EOF
 
 	cp "$workdir"/vulkan.adreno.so "$magiskdir/$p1"
