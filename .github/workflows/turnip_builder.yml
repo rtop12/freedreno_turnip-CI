@@ -21,16 +21,17 @@ jobs:
       run: bash ./turnip_builder.sh
 
     # =========================================================
-    # 【新增】上传提取出来的最新纯净版 tu_cmd_buffer.cc
+    # 【核心修改】加上 if: always()，这样哪怕编译失败也会上传
     # =========================================================
     - name: Upload Original tu_cmd_buffer.cc
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: original_tu_cmd_buffer
         path: turnip_workdir/original_tu_cmd_buffer.zip
 
-    # 上传日志，路径已经修正为 mesa-src（防止找不到报错）
     - name: Upload logs for debugging
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: meson_ninja_logs
@@ -38,8 +39,8 @@ jobs:
           turnip_workdir/ninja_log
           turnip_workdir/mesa-src/build-android-aarch64/meson-logs/meson-log.txt
 
-    # 如果你的代码没问题，这里会生成最终的卡刷包
     - name: Release "turnip"
+      if: success() # 只有编译成功才发布 Release
       uses: softprops/action-gh-release@v1
       with:
         body: Turnip magisk module and driver package for adrenotools
