@@ -20,7 +20,7 @@
 
 #include "tu_image.h"
 #include "tu_knl.h"
-#include "tu_tile_config.h"
+
 #include "tu_tracepoints.h"
 #include "tu_subsampled_image.h"
 
