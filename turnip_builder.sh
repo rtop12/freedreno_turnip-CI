@@ -14,8 +14,6 @@ mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
 
 clear
 
-#There are 4 functions here, simply comment to disable.
-#You can insert your own function and make a pull request.
 run_all(){
 	check_deps
 	prepare_workdir
@@ -131,7 +129,7 @@ vbo_code = """
 anchor_vbo = "cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;"
 content = safe_replace(content, anchor_vbo, vbo_code, "VBO Mapping")
 
-# 3. 注入 Push Constants 截取
+# 3. 注入 Push Constants 截取 (修正了锚点，使用该函数独有的 memcpy 语句)
 push_code = """
    /* === 插入 Push Constants 截取开始 === */
    if (g_draw_count < MAX_DUMP_DRAWS) {
@@ -146,7 +144,8 @@ push_code = """
    }
    /* === 插入 Push Constants 截取结束 === */
 """
-anchor_push = "cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;"
+# 这个锚点只存在于 tu_CmdPushConstants2KHR 中，绝不会插错位置
+anchor_push = "pPushConstantsInfo->pValues, pPushConstantsInfo->size);"
 content = safe_replace(content, anchor_push, push_code, "Push Constants")
 
 # 4. 注入 Draw 截取
