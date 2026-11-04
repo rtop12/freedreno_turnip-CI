@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Turnip Vulkan 驱动层 DrawCall 模型矩阵提取
+# Turnip Vulkan 驱动层 DrawCall 模型矩阵提取 (修复版)
 # ==========================================
 
 green='\033[0;32m'
@@ -70,8 +70,7 @@ draw_hook_code = r'''
    struct timespec now_draw;
    clock_gettime(CLOCK_MONOTONIC, &now_draw);
    
-   // 限制频率，防止卡顿（这里为了不漏数据，改成 0.5 秒抓一次，也就是每两帧抓一次）
-   // 你可以根据实际情况调整，比如去掉 if 限制直接抓
+   // 限制频率：1秒抓一次，只抓大模型（过滤掉UI和简单特效）
    if (now_draw.tv_sec != last_draw_sec && indexCount > 1000) {
        last_draw_sec = now_draw.tv_sec;
        
@@ -79,8 +78,8 @@ draw_hook_code = r'''
        if (fp) {
            fprintf(fp, "\n[DrawIndexed] IndexCount: %u | InstanceCount: %u\n", indexCount, instanceCount);
            
-           // 1. 检查当前绑定的描述符集 (通常存放模型矩阵)
-           struct tu_descriptor_state *desc_state = &cmd->state.descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
+           // 获取当前绑定的描述符集 (存放模型矩阵的地方)
+           struct tu_descriptor_state *desc_state = tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
            
            for (uint32_t s = 0; s < desc_state->max_sets_bound; s++) {
                struct tu_descriptor_set *set = desc_state->sets[s];
@@ -89,15 +88,16 @@ draw_hook_code = r'''
                for (uint32_t b = 0; b < set->layout->binding_count; b++) {
                    struct tu_descriptor_set_binding_layout *binding = &set->layout->binding[b];
                    
+                   // 找 UBO 或 SSBO
                    if (binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || 
                        binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
                        
-                       // 如果这块 UBO/SSBO 的 CPU 映射指针存在，直接读！
+                       // 如果这块内存 CPU 可读，直接暴力提取
                        if (set->mapped_ptr) {
                            float *data = (float *)((char*)set->mapped_ptr + binding->offset);
                            
-                           // 尝试寻找浮点矩阵的平移分量（打印前几个矩阵看看）
                            fprintf(fp, "  Set[%u] Bind[%u] Data:\n", s, b);
+                           // 打印前 16 个 float (一个 4x4 矩阵)
                            for (int k = 0; k < 16; k++) {
                                if (isfinite(data[k]) && fabs(data[k]) < 100000.0f) {
                                    fprintf(fp, "%8.2f ", data[k]);
@@ -110,29 +110,25 @@ draw_hook_code = r'''
                    }
                }
            }
-           
-           // 2. 检查顶点实例缓冲 (如果使用了 Instance Rendering，坐标可能在 Vertex Buffer 里)
-           // cmd->state.vb 包含了当前绑定的所有 Vertex Buffer
-           for (int i = 0; i < cmd->state.max_vbs_bound; i++) {
-               if (cmd->state.vb[i].base != 0) {
-                   // 这里的 base 是 IOVA，我们不能直接读。但如果是 Host Visible 的，前面已经读过了。
-                   // 打印一下看看大小，区分它是网格还是实例数据
-                   // fprintf(fp, "  VB[%d] Base: 0x%llx\n", i, cmd->state.vb[i].base);
-               }
-           }
-           
            fclose(fp);
        }
    }
 '''
 
-# 寻找 tu_CmdDrawIndexed
 target_draw = 'tu_CmdDrawIndexed('
 start_idx = content.find(target_draw)
 if start_idx != -1:
-    brace_idx = content.find('{', start_idx)
-    content = content[:brace_idx+1] + draw_hook_code + content[brace_idx+1:]
-    print('✅ CmdDrawIndexed 模型矩阵注入成功！')
+    # 寻找函数体内的 VK_FROM_HANDLE 宏，它定义了 cmd 变量
+    handle_str = 'VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);'
+    handle_idx = content.find(handle_str, start_idx)
+    
+    if handle_idx != -1:
+        # 将代码插在 VK_FROM_HANDLE 之后
+        insert_idx = handle_idx + len(handle_str)
+        content = content[:insert_idx] + '\n' + draw_hook_code + content[insert_idx:]
+        print('✅ CmdDrawIndexed 模型矩阵注入成功！')
+    else:
+        print('❌ 找不到 VK_FROM_HANDLE，注入失败')
 else:
     print('❌ 找不到 tu_CmdDrawIndexed')
 
