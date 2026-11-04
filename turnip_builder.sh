@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 全通道探针...${nocolor}"
+    echo -e "${green}正在注入 严格进程过滤版探针...${nocolor}"
     cat << 'PYEOF' > inject.py
 import re
 
@@ -63,54 +63,67 @@ with open(filepath, "r", encoding="utf-8") as f:
 global_code = '''
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 static float g_current_matrix[16] = {0};
 static uint64_t g_current_vbo_iova = 0;
-static uint32_t g_current_vbo_size = 0;
 static uint64_t g_saved_desc_iova[MAX_SETS] = {0};
 
-static void log_all_data(struct tu_cmd_buffer *cmd, const char* func_name, uint32_t count) {
-    static uint32_t dump_cnt = 0;
-    if (dump_cnt++ % 200 != 0) return; 
+// 强力判断是不是三角洲行动
+static bool is_game_process() {
+    char buf[256] = {0};
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return false;
+    int len = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    // 必须精确匹配进程名
+    return strstr(buf, "com.tencent.tmgp.dfm") != NULL;
+}
 
-    mesa_loge("ESP_ALL: --- %s (Count: %u) ---", func_name, count);
+static void log_all_data(struct tu_cmd_buffer *cmd, const char* func_name, uint32_t count) {
+    if (!is_game_process()) return;
+
+    // 限制打印频率，防止刷屏
+    static uint32_t dump_cnt = 0;
+    if (dump_cnt++ % 50 != 0) return; 
+
+    mesa_loge("ESP_GAME: --- %s (Count: %u) ---", func_name, count);
     
+    // 1. 检查矩阵
     bool has_mat = false;
     for(int i=0; i<16; i++) if(g_current_matrix[i] != 0.0f) { has_mat = true; break; }
     if (has_mat) {
-        mesa_loge("ESP_ALL: Matrix: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", 
+        mesa_loge("ESP_GAME: Matrix: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", 
               g_current_matrix[0], g_current_matrix[1], g_current_matrix[2], g_current_matrix[3],
               g_current_matrix[12], g_current_matrix[13], g_current_matrix[14], g_current_matrix[15]);
     }
 
-    // 如果抓到了传统 VBO
+    // 2. 检查 VBO
     if (g_current_vbo_iova != 0) {
         struct tu_bo *bo = tu_device_lookup_bo(cmd->device, g_current_vbo_iova);
         if (bo && bo->map) {
             float *vals = (float*)((char *)bo->map + (g_current_vbo_iova - bo->iova));
-            mesa_loge("ESP_ALL: VBO Data: %.2f %.2f %.2f | %.2f %.2f %.2f", 
+            mesa_loge("ESP_GAME: VBO Data: %.2f %.2f %.2f | %.2f %.2f %.2f", 
                       vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]);
         }
     }
 
-    // 如果抓到了 Descriptor Buffer
+    // 3. 检查 Descriptor Sets
     for (int i=0; i<MAX_SETS; i++) {
         if (g_saved_desc_iova[i] == 0) continue;
         struct tu_bo *bo = tu_device_lookup_bo(cmd->device, g_saved_desc_iova[i]);
         if (bo && bo->map) {
             float *vals = (float*)((char *)bo->map + (g_saved_desc_iova[i] - bo->iova));
-            // 只打印前 6 个 float 看看是不是坐标
-            mesa_loge("ESP_ALL: Desc[%d] Data: %.2f %.2f %.2f | %.2f %.2f %.2f", 
+            mesa_loge("ESP_GAME: Desc[%d] Data: %.2f %.2f %.2f | %.2f %.2f %.2f", 
                       i, vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]);
         }
     }
 }
 '''
 
-# 1. 注入全局
 code = code.replace('enum tu_cmd_buffer_status {', global_code + '\nenum tu_cmd_buffer_status {')
 
-# 2. 截获矩阵
 code = code.replace(
     'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n}\nTU_GENX(tu_CmdPushConstants2KHR);',
     '''cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
@@ -121,19 +134,16 @@ code = code.replace(
 TU_GENX(tu_CmdPushConstants2KHR);'''
 )
 
-# 3. 截获 VBO
 code = code.replace(
     'cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
     '''   if (bindingCount > 0) { 
        g_current_vbo_iova = cmd->state.vb[firstBinding].base; 
-       g_current_vbo_size = cmd->state.vb[firstBinding].size; 
    }
    cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;
 }\n''',
     1
 )
 
-# 4. 截获 Descriptor Sets (关键！)
 code = code.replace(
     'descriptors_state->set_iova[idx] = set ? (set->va | BINDLESS_DESCRIPTOR_64B) : 0;',
     '''descriptors_state->set_iova[idx] = set ? (set->va | BINDLESS_DESCRIPTOR_64B) : 0;
@@ -142,7 +152,6 @@ code = code.replace(
        }'''
 )
 
-# 5. 在 Draw 里打印
 code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 
                     'log_all_data(cmd, "tu_CmdDraw", vertexCount);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
 code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 
