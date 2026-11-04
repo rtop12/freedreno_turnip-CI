@@ -1,6 +1,7 @@
 #!/bin/bash -e
 
 export TERM=xterm
+
 #Define variables
 green='\033[0;32m'
 red='\033[0;31m'
@@ -64,7 +65,7 @@ prepare_workdir(){
 		cd mesa-main
 
 	# =========================================================================
-	# 核心修改点：使用 REPO_ROOT 绝对路径去替换，绝对不会找不到！
+	# 核心修改点：使用绝对路径去替换
 	# =========================================================================
 	if [ -f "$REPO_ROOT/tu_cmd_buffer.cc" ]; then
 		echo -e "${green}Found custom tu_cmd_buffer.cc at $REPO_ROOT, applying patch ...${nocolor}" $'\n'
@@ -138,10 +139,12 @@ EOF
 			-Degl=disabled &> "$workdir/meson_log"
 
 	echo "Compiling build files ..." $'\n'
-		ninja -C build-android-aarch64 &> "$workdir/ninja_log"
+		# 把编译错误也输出到控制台，方便排查
+		ninja -C build-android-aarch64 2>&1 | tee "$workdir/ninja_log"
 
 	if ! [ -a "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
-		echo -e "$red Build failed! Check the log above. $nocolor" && exit 1
+		echo -e "$red Build failed! Here is the error log: $nocolor" 
+		exit 1
 	fi
 }
 
