@@ -37,9 +37,9 @@ prepare_workdir(){
 	cd mesa-main
 }
 
-# ================= 终极双模解析：抓取渲染前明文 =================
+# ================= 终极杀招：拦截 DescriptorSets =================
 inject_custom_code(){
-	echo "正在注入终极双模解析代码..." $'\n'
+	echo "正在注入 DescriptorSet 雷达..." $'\n'
 	
 	cat << 'PYEOF' > /tmp/inject.py
 import sys
@@ -50,59 +50,47 @@ with open(file_path, 'r') as f:
 
 content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>\n#include <stdint.h>')
 
+# 插入到 vkCmdBindDescriptorSets 函数内部
 hook_code = r'''
-         // 只抓取大缓冲（过滤掉小的UI/特效）
-         if (buf && buf->bo && buf->bo->size > 50000) {
-             static long last_sec = 0;
-             struct timespec now;
-             clock_gettime(CLOCK_MONOTONIC, &now);
+         static long last_sec = 0;
+         struct timespec now;
+         clock_gettime(CLOCK_MONOTONIC, &now);
+         
+         if (now.tv_sec != last_sec && setCount > 0 && pDescriptorSets != NULL) {
+             last_sec = now.tv_sec;
              
-             // 每秒抓1次，防止游戏瞬间卡死
-             if (now.tv_sec != last_sec) {
-                 last_sec = now.tv_sec;
+             FILE *fp = fopen("/sdcard/turnip_matrix.txt", "a");
+             if (fp) {
+                 fprintf(fp, "\n>>> DescriptorSet Count: %u <<<\n", setCount);
                  
-                 void *map_addr = buf->bo->map;
-                 if (map_addr == NULL) {
-                     tu_bo_map(cmd->device, buf->bo, NULL);
-                     map_addr = buf->bo->map;
-                 }
-                 
-                 if (map_addr) {
-                     // 获取当前绑定的偏移量
-                     uint64_t offset = pOffsets[i];
+                 for (uint32_t s = 0; s < setCount; s++) {
+                     // 强转指针，暴力扫描内存
+                     uint32_t *set_ptr = (uint32_t *)pDescriptorSets[s];
+                     float *f_data = (float *)pDescriptorSets[s];
                      
-                     // 确保偏移没越界
-                     if (offset < buf->bo->size - 100) {
-                         uint8_t *real_addr = (uint8_t *)map_addr + offset;
-                         float *f_data = (float *)real_addr;
-                         uint16_t *h_data = (uint16_t *)real_addr;
+                     if (set_ptr && f_data) {
+                         fprintf(fp, "Set[%u] 内存扫描:\n", s);
                          
-                         FILE *fp = fopen("/sdcard/turnip_ue4_coords.txt", "a");
-                         if (fp) {
-                             fprintf(fp, "\n>>> Buffer Size: %u | Offset: %llu <<<\n", (uint32_t)buf->bo->size, (unsigned long long)offset);
+                         // 扫描前 128 个 Float，找具有特征的数值
+                         for (int k = 0; k < 128; k++) {
+                             float val = f_data[k];
                              
-                             // 暴力扫描这个块里的前 500 个数值
-                             for (int k = 0; k < 500; k++) {
-                                 float f_val = f_data[k];
-                                 
-                                 // 过滤掉 0，寻找带有小数的真实世界坐标（-5000 到 5000）
-                                 if (f_val != 0.0f && f_val > -5000.0f && f_val < 5000.0f && (f_val != (int)f_val)) {
-                                     // 顺便打印出相邻的两个数，大概率组成 XYZ
-                                     fprintf(fp, "[Float] %8.3f, %8.3f, %8.3f\n", f_data[k], f_data[k+1], f_data[k+2]);
-                                     k += 2; // 跳过后面的值
-                                 }
+                             // 过滤条件：非 0、在合理范围、并且有小数
+                             if (val != 0.0f && val > -10000.0f && val < 10000.0f && (val != (int)val)) {
+                                 fprintf(fp, "  [Float] %10.3f (Hex: 0x%08X)\n", val, set_ptr[k]);
                              }
-                             fclose(fp);
                          }
                      }
                  }
+                 fclose(fp);
              }
          }
 '''
 
-target_str = 'struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);'
-if target_str in content:
-    content = content.replace(target_str, target_str + '\n' + hook_code)
+# 找到目标函数，并插入代码
+target_func_header = 'tu_CmdBindDescriptorSets2KHR('
+if target_func_header in content:
+    content = content.replace(target_func_header, target_func_header + '\n' + hook_code)
     print('✅ 源码注入成功！')
 else:
     print('❌ 找不到目标函数')
