@@ -73,14 +73,10 @@ file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
 with open(file_path, 'r') as f:
     content = f.read()
 
-# 1. 只注入 stdio 和 time，不包含找不到的 drm 头文件
 content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>')
 
-# 2. 注入截获代码（直接使用 extern 声明函数，无视头文件缺失）
+# 直接使用 tu_bo 的 map 指针和 tu_bo_map，彻底避免类型不匹配和找不到头文件的问题
 hook_code = r'''
-         extern void *fd_bo_map(struct fd_bo *bo);
-         extern void fd_bo_unmap(struct fd_bo *bo);
-
          if (buf && buf->bo) {
             static struct timespec last_time = {0, 0};
             struct timespec now;
@@ -88,20 +84,26 @@ hook_code = r'''
             long diff_ms = (now.tv_sec - last_time.tv_sec) * 1000 + (now.tv_nsec - last_time.tv_nsec) / 1000000;
             
             if (diff_ms >= 200) {
-               void *map_addr = fd_bo_map(buf->bo);
+               // 直接获取 CPU 映射地址，如果为空则尝试映射
+               void *map_addr = buf->bo->map;
+               if (map_addr == NULL) {
+                  tu_bo_map(cmd->device, buf->bo, NULL);
+                  map_addr = buf->bo->map;
+               }
+               
                if (map_addr) {
                   float *verts = (float *)map_addr;
                   fprintf(stderr, "TURNIP_DUMP: %.1f,%.1f,%.1f | %.1f,%.1f,%.1f | %.1f,%.1f,%.1f\n", 
                            verts[0], verts[1], verts[2], verts[3], verts[4], verts[5], verts[6], verts[7], verts[8]);
                   fflush(stderr);
-                  fd_bo_unmap(buf->bo);
+                  
+                  // 注意：不需要 unmap，这是持久映射
                   last_time = now;
                }
             }
          }
 '''
 
-# 3. 强行把代码插进 tu_CmdBindVertexBuffers2 函数里
 target_str = 'struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);'
 if target_str in content:
     content = content.replace(target_str, target_str + '\n' + hook_code)
