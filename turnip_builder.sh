@@ -155,7 +155,7 @@ endian = 'little'
 EOF
 
 	set +e
-	# 【重点修改】删除了 -DVulkan-beta=true
+	# 【重点修改】删除了 -Db_lto=true
 	meson setup build-android-aarch64 \
 		--cross-file "android-aarch64.txt" \
 		--native-file "native.txt" \
@@ -166,7 +166,6 @@ EOF
 		-Dgallium-drivers= \
 		-Dvulkan-drivers=freedreno \
 		-Dfreedreno-kmds=kgsl \
-		-Db_lto=true \
 		-Dstrip=true \
 		-Degl=disabled &> "$workdir/meson_log"
 
