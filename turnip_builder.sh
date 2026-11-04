@@ -14,12 +14,10 @@ ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
 sdkver="34"
 mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
 
-# 获取当前脚本所在的根目录（绝对路径）
 REPO_ROOT="$(pwd)"
 
 clear
 
-#There are 4 functions here, simply comment to disable.
 run_all(){
 	check_deps
 	prepare_workdir
@@ -45,8 +43,9 @@ check_deps(){
 			then echo "Please install missing dependencies" && exit 1
 		fi
 
-	echo "Installing python Mako dependency (if missing) ..." $'\n'
-		pip install mako &> /dev/null
+	echo "Upgrading meson and installing python dependencies ..." $'\n'
+    # 强制升级 meson 到最新版，并安装 mako
+	pip install --upgrade meson mako &> /dev/null
 }
 
 prepare_workdir(){
@@ -64,20 +63,15 @@ prepare_workdir(){
 		unzip -q mesa-main.zip &> /dev/null
 		cd mesa-main
 
-	# =========================================================================
-	# 核心修改点：使用绝对路径去替换
-	# =========================================================================
 	if [ -f "$REPO_ROOT/tu_cmd_buffer.cc" ]; then
-		echo -e "${green}Found custom tu_cmd_buffer.cc at $REPO_ROOT, applying patch ...${nocolor}" $'\n'
+		echo -e "${green}Found custom tu_cmd_buffer.cc, applying patch ...${nocolor}" $'\n'
 		cp "$REPO_ROOT/tu_cmd_buffer.cc" src/freedreno/vulkan/tu_cmd_buffer.cc
 	else
-		echo -e "${red}WARNING: custom tu_cmd_buffer.cc NOT FOUND at $REPO_ROOT! Building original code.${nocolor}" $'\n'
+		echo -e "${red}WARNING: custom tu_cmd_buffer.cc NOT FOUND! Building original code.${nocolor}" $'\n'
 	fi
-	# =========================================================================
 }
 
 build_lib_for_android(){
-	#Workaround for using Clang as c compiler instead of GCC
 	mkdir -p "$workdir/bin"
 	ln -sf "$ndk/clang" "$workdir/bin/cc"
 	ln -sf "$ndk/clang++" "$workdir/bin/c++"
@@ -123,6 +117,7 @@ cpu = 'x86_64'
 endian = 'little'
 EOF
 
+        # 把 meson setup 的输出不隐藏，直接打印出来
 		meson setup build-android-aarch64 \
 			--cross-file "android-aarch64.txt" \
 			--native-file "native.txt" \
@@ -136,14 +131,18 @@ EOF
 			-Dfreedreno-kmds=kgsl \
 			-Db_lto=true \
 			-Dstrip=true \
-			-Degl=disabled &> "$workdir/meson_log"
+			-Degl=disabled 2>&1 | tee "$workdir/meson_log"
+
+        if [ $? -ne 0 ]; then
+            echo -e "$red Meson setup failed! $nocolor"
+            exit 1
+        fi
 
 	echo "Compiling build files ..." $'\n'
-		# 把编译错误也输出到控制台，方便排查
 		ninja -C build-android-aarch64 2>&1 | tee "$workdir/ninja_log"
 
 	if ! [ -a "$workdir"/mesa-main/build-android-aarch64/src/freedreno/vulkan/libvulkan_freedreno.so ]; then
-		echo -e "$red Build failed! Here is the error log: $nocolor" 
+		echo -e "$red Build failed! $nocolor" 
 		exit 1
 	fi
 }
