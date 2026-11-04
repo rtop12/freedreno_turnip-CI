@@ -17,7 +17,7 @@
 
 #include "tu_clear_blit.h"
 #include "tu_cs.h"
-#include "tu_event.h"
+
 #include "tu_image.h"
 #include "tu_knl.h"
 #include "tu_tile_config.h"
