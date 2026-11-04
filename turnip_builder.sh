@@ -37,9 +37,9 @@ prepare_workdir(){
 	cd mesa-main
 }
 
-# ================= 终极雷达扫描注入代码 =================
+# ================= 终极双模解析：抓取渲染前明文 =================
 inject_custom_code(){
-	echo "正在注入雷达扫描代码..." $'\n'
+	echo "正在注入终极双模解析代码..." $'\n'
 	
 	cat << 'PYEOF' > /tmp/inject.py
 import sys
@@ -51,12 +51,13 @@ with open(file_path, 'r') as f:
 content = content.replace('#include "tu_cmd_buffer.h"', '#include "tu_cmd_buffer.h"\n#include <stdio.h>\n#include <time.h>\n#include <stdint.h>')
 
 hook_code = r'''
-         // 只要 Buffer 够大（大于 1KB），我们就像雷达一样全盘扫描
-         if (buf && buf->bo && buf->bo->size > 1024 && buf->bo->size < 5000000) {
+         // 只抓取大缓冲（过滤掉小的UI/特效）
+         if (buf && buf->bo && buf->bo->size > 50000) {
              static long last_sec = 0;
              struct timespec now;
              clock_gettime(CLOCK_MONOTONIC, &now);
              
+             // 每秒抓1次，防止游戏瞬间卡死
              if (now.tv_sec != last_sec) {
                  last_sec = now.tv_sec;
                  
@@ -67,33 +68,32 @@ hook_code = r'''
                  }
                  
                  if (map_addr) {
-                     float *f_data = (float *)map_addr;
-                     uint32_t total_floats = buf->bo->size / 4;
+                     // 获取当前绑定的偏移量
+                     uint64_t offset = pOffsets[i];
                      
-                     FILE *fp = fopen("/sdcard/turnip_radar.txt", "a");
-                     if (fp) {
-                         fprintf(fp, "\n>>> 扫描到巨型Buffer，大小: %u 字节 <<<\n", (uint32_t)buf->bo->size);
+                     // 确保偏移没越界
+                     if (offset < buf->bo->size - 100) {
+                         uint8_t *real_addr = (uint8_t *)map_addr + offset;
+                         float *f_data = (float *)real_addr;
+                         uint16_t *h_data = (uint16_t *)real_addr;
                          
-                         int found_count = 0;
-                         // 遍历整个 Buffer 里的所有浮点数
-                         for (uint32_t k = 0; k < total_floats - 2; k++) {
-                             float x = f_data[k];
-                             float y = f_data[k+1];
-                             float z = f_data[k+2];
+                         FILE *fp = fopen("/sdcard/turnip_ue4_coords.txt", "a");
+                         if (fp) {
+                             fprintf(fp, "\n>>> Buffer Size: %u | Offset: %llu <<<\n", (uint32_t)buf->bo->size, (unsigned long long)offset);
                              
-                             // 【核心雷达】寻找符合 3D 世界坐标特征的数据
-                             // 特征：在 -5000 到 5000 之间，且不是 0，且带有小数
-                             if (x > -5000 && x < 5000 && y > -5000 && y < 5000 && z > -5000 && z < 5000 &&
-                                 x != 0.0f && y != 0.0f && z != 0.0f &&
-                                 (x != (int)x || y != (int)y || z != (int)z)) {
+                             // 暴力扫描这个块里的前 500 个数值
+                             for (int k = 0; k < 500; k++) {
+                                 float f_val = f_data[k];
                                  
-                                 fprintf(fp, "定位到: X: %.3f, Y: %.3f, Z: %.3f\n", x, y, z);
-                                 found_count++;
-                                 // 一帧只打印 20 个，防止文件爆掉
-                                 if (found_count > 20) break; 
+                                 // 过滤掉 0，寻找带有小数的真实世界坐标（-5000 到 5000）
+                                 if (f_val != 0.0f && f_val > -5000.0f && f_val < 5000.0f && (f_val != (int)f_val)) {
+                                     // 顺便打印出相邻的两个数，大概率组成 XYZ
+                                     fprintf(fp, "[Float] %8.3f, %8.3f, %8.3f\n", f_data[k], f_data[k+1], f_data[k+2]);
+                                     k += 2; // 跳过后面的值
+                                 }
                              }
+                             fclose(fp);
                          }
-                         fclose(fp);
                      }
                  }
              }
