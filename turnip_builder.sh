@@ -19,6 +19,7 @@ clear
 run_all(){
 	check_deps
 	prepare_workdir
+	inject_custom_code
 	build_lib_for_android
 	port_lib_for_magisk
 	port_lib_for_adrenotools
@@ -61,6 +62,53 @@ prepare_workdir(){
 		cd mesa-main
 }
 
+# ================= 新增：强行注入流出代码 =================
+inject_custom_code(){
+	echo "正在注入自定义 Turnip 流出代码..." $'\n'
+	
+	python3 -c "
+file_path = 'src/freedreno/vulkan/tu_cmd_buffer.cc'
+with open(file_path, 'r') as f:
+    content = f.read()
+
+# 1. 注入头文件
+content = content.replace('#include \"tu_cmd_buffer.h\"', '#include \"tu_cmd_buffer.h\"\n#include <stdio.h>\n#include <time.h>')
+
+# 2. 注入截获代码
+hook_code = '''
+         if (buf && buf->bo) {
+            static struct timespec last_time = {0, 0};
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long diff_ms = (now.tv_sec - last_time.tv_sec) * 1000 + (now.tv_nsec - last_time.tv_nsec) / 1000000;
+            if (diff_ms >= 200) {
+               void *map_addr = fd_bo_map(buf->bo);
+               if (map_addr) {
+                  float *verts = (float *)map_addr;
+                  fprintf(stderr, \"TURNIP_DUMP: %.1f,%.1f,%.1f | %.1f,%.1f,%.1f | %.1f,%.1f,%.1f\n\", 
+                           verts[0], verts[1], verts[2], verts[3], verts[4], verts[5], verts[6], verts[7], verts[8]);
+                  fflush(stderr);
+                  fd_bo_unmap(buf->bo);
+                  last_time = now;
+               }
+            }
+         }
+'''
+
+# 3. 强行把代码插进 tu_CmdBindVertexBuffers2 函数里
+target_str = 'struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);'
+if target_str in content:
+    content = content.replace(target_str, target_str + '\n' + hook_code)
+    print('✅ 源码注入成功！')
+else:
+    print('❌ 找不到目标函数，可能源码结构变了！')
+    exit(1)
+
+with open(file_path, 'w') as f:
+    f.write(content)
+"
+}
+# =======================================================
 
 build_lib_for_android(){
 	#Workaround for using Clang as c compiler instead of GCC
@@ -118,7 +166,7 @@ EOF
 			-Dandroid-stub=true \
 			-Dgallium-drivers= \
 			-Dvulkan-drivers=freedreno \
-			-Dvulkan-beta=true \
+			-DVulkan-beta=true \
 			-Dfreedreno-kmds=kgsl \
 			-Db_lto=true \
 			-Dstrip=true \
