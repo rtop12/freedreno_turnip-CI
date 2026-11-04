@@ -22,7 +22,7 @@
 #include "tu_knl.h"
 
 #include "tu_tracepoints.h"
-#include "tu_subsampled_image.h"
+
 
 #include "common/freedreno_gpu_event.h"
 #include "common/freedreno_lrz.h"
