@@ -5,14 +5,13 @@ export TERM=xterm
 green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
-deps="meson ninja patchelf unzip curl pip flex bison zip"
+deps="meson ninja patchelf unzip curl pip flex bison zip python3"
 workdir="$(pwd)/turnip_workdir"
 magiskdir="$workdir/turnip_module"
 ndkver="android-ndk-r28"
 ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
 sdkver="34"
 mesasrc="https://gitlab.freedesktop.org/mesa/mesa/-/archive/main/mesa-main.zip"
-REPO_ROOT="$(pwd)"
 
 clear
 
@@ -55,18 +54,112 @@ prepare_workdir(){
     MESA_DIR=$(find . -maxdepth 1 -type d -name "mesa-*" ! -name "mesa-src.zip" | head -n 1)
     mv "$MESA_DIR" mesa-src
     cd mesa-src
-    
-    echo -e "${green}提取纯净版 tu_cmd_buffer.cc 中...${nocolor}"
-    cp src/freedreno/vulkan/tu_cmd_buffer.cc "$workdir/tu_cmd_buffer_original.cc"
-    cd "$workdir"
-    zip -q original_tu_cmd_buffer.zip tu_cmd_buffer_original.cc
-    cd mesa-src
 
-	if [ -f "$REPO_ROOT/tu_cmd_buffer.cc" ]; then
-		echo -e "${green}Found custom tu_cmd_buffer.cc, applying patch ...${nocolor}" $'\n'
-		cp "$REPO_ROOT/tu_cmd_buffer.cc" src/freedreno/vulkan/tu_cmd_buffer.cc
+    # =========================================================================
+    # 【核心注入逻辑】：使用 Python 自动修改源码
+    # =========================================================================
+    echo -e "${green}正在向 tu_cmd_buffer.cc 注入 ESP Dump 代码...${nocolor}"
+    cat << 'PYEOF' > inject.py
+import re
+
+filepath = "src/freedreno/vulkan/tu_cmd_buffer.cc"
+with open(filepath, "r", encoding="utf-8") as f:
+    code = f.read()
+
+# 1. 注入头文件与全局变量
+global_code = '''
+#include <stdio.h>
+#include <string.h>
+
+static float g_current_matrix[16] = {0};
+static uint64_t g_current_vbo_iova = 0;
+static uint32_t g_current_vbo_size = 0;
+static uint64_t g_last_vbo_iova = 0;
+
+static void dump_draw_data(struct tu_device *device, uint32_t count) {
+    if (count < 500 || g_current_vbo_iova == 0) return;
+    // mesa_loge("ESP_DUMP: count=%u, vbo_iova=%" PRIx64, count, g_current_vbo_iova);
+
+    if (g_current_vbo_iova == g_last_vbo_iova) return;
+    g_last_vbo_iova = g_current_vbo_iova;
+
+    struct tu_bo *bo = tu_device_lookup_bo(device, g_current_vbo_iova);
+    if (bo && bo->map) {
+        uint64_t offset_in_bo = g_current_vbo_iova - bo->iova;
+        void *cpu_vbo_ptr = (void *)((char *)bo->map + offset_in_bo);
+
+        const char* paths[] = {
+            "/storage/emulated/0/vulkan_dump.txt",
+            "/sdcard/vulkan_dump.txt",
+            "/data/local/tmp/vulkan_dump.txt",
+            "/sdcard/Download/vulkan_dump.txt"
+        };
+        
+        FILE *fp = NULL;
+        for (int i = 0; i < 4; i++) {
+            fp = fopen(paths[i], "a+"); 
+            if (fp) break;
+        }
+
+        if (fp) {
+            fprintf(fp, "--- Draw Call (Count: %u) ---\\n", count);
+            fprintf(fp, "Matrix: ");
+            for (int i = 0; i < 16; i++) {
+                fprintf(fp, "%f, ", g_current_matrix[i]);
+            }
+            fprintf(fp, "\\nVertices:\\n");
+            float* verts = (float*)cpu_vbo_ptr;
+            uint32_t num_verts = (g_current_vbo_size / 12);
+            if (num_verts > 5) num_verts = 5; 
+            for (uint32_t v = 0; v < num_verts; v++) {
+                fprintf(fp, "  V%d: X=%f, Y=%f, Z=%f\\n", v, verts[v*3], verts[v*3+1], verts[v*3+2]);
+            }
+            fprintf(fp, "\\n");
+            fclose(fp);
+        }
+    }
+}
+'''
+code = code.replace('#include "tu_trace_bin_layout.h"', '#include "tu_trace_bin_layout.h"\n' + global_code)
+
+# 2. 注入 PushConstants 截获矩阵
+code = code.replace(
+    'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n}\nTU_GENX(tu_CmdPushConstants2KHR);',
+    'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n   if (pPushConstantsInfo->size >= 64) memcpy(g_current_matrix, pPushConstantsInfo->pValues, 64);\n}\nTU_GENX(tu_CmdPushConstants2KHR);'
+)
+
+# 3. 注入 BindVertexBuffers2 截获 VBO
+code = code.replace(
+    'cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
+    '   if (bindingCount > 0) { g_current_vbo_iova = cmd->state.vb[firstBinding].base; g_current_vbo_size = cmd->state.vb[firstBinding].size; }\n   cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
+    1
+)
+
+# 4. 注入 Draw 函数中的 dump_draw_data
+code = code.replace('tu6_emit_vs_params(cmd, NULL, 0, firstVertex, firstInstance);\n\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 'dump_draw_data(cmd->device, vertexCount);\n   tu6_emit_vs_params(cmd, NULL, 0, firstVertex, firstInstance);\n\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
+code = code.replace('tu6_emit_vs_params(cmd, NULL, 0, vertexOffset, firstInstance);\n\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 'dump_draw_data(cmd->device, indexCount);\n   tu6_emit_vs_params(cmd, NULL, 0, vertexOffset, firstInstance);\n\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
+code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, 0);\n\n   const uint32_t dst_off = vs_params_offset(cmd);', 'dump_draw_data(cmd->device, 99999);\n   tu6_draw_common<CHIP>(cmd, cs, false, 0);\n\n   const uint32_t dst_off = vs_params_offset(cmd);')
+code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, 0);\n\n   const uint32_t dst_off = vs_params_offset(cmd);', 'dump_draw_data(cmd->device, 99999);\n   tu6_draw_common<CHIP>(cmd, cs, true, 0);\n\n   const uint32_t dst_off = vs_params_offset(cmd);')
+
+# 5. 帧重置
+code = code.replace('return vk_command_buffer_end(&cmd_buffer->vk);', 'g_last_vbo_iova = 0;\n   return vk_command_buffer_end(&cmd_buffer->vk);')
+
+with open(filepath, "w", encoding="utf-8") as f:
+    f.write(code)
+print("Patch applied successfully!")
+PYEOF
+
+    python3 inject.py
+    rm inject.py
+    echo -e "${green}代码注入完成！${nocolor}"
+    # =========================================================================
+
+    # 如果你本地传了 tu_cmd_buffer.cc，它会覆盖脚本注入的版本；如果你没传，就直接用上面脚本注入的
+	if [ -f "$(dirname "$workdir")/tu_cmd_buffer.cc" ]; then
+		echo -e "${green}检测到本地自定义文件，将其覆盖...${nocolor}" $'\n'
+		cp "$(dirname "$workdir")/tu_cmd_buffer.cc" src/freedreno/vulkan/tu_cmd_buffer.cc
 	else
-		echo -e "${red}WARNING: custom tu_cmd_buffer.cc NOT FOUND! Building original code.${nocolor}" $'\n'
+		echo -e "${green}未检测到本地文件，直接使用脚本自动注入的版本编译。${nocolor}" $'\n'
 	fi
 }
 
