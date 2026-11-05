@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 全量 VBO 数据实时直传逻辑...${nocolor}"
+    echo -e "${green}正在注入 内部存储文件写入逻辑...${nocolor}"
     
     cat << 'PYEOF' > inject_all.py
 import re
@@ -65,7 +65,6 @@ filepath = "src/freedreno/vulkan/tu_device.h"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 【修复点】：必须插在 struct vk_device vk; 之后，否则 vk 的偏移不是0
 if "int dump_ko_fd;" not in code:
     code = re.sub(r'(struct tu_device\s*\{\s*struct vk_device vk;)', r'\1\n   int dump_ko_fd;', code, count=1)
 
@@ -78,15 +77,9 @@ with open(filepath, "w", encoding="utf-8") as f:
 filepath = "src/freedreno/vulkan/tu_device.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
-
 if "device->dump_ko_fd =" not in code:
-    target = "device->instance = physical_device->instance;"
-    replace = target + '\n   device->dump_ko_fd = open("/dev/my_gpu_dump", O_RDWR | O_NONBLOCK);'
-    code = code.replace(target, replace, 1)
-    
-    if "#include <fcntl.h>" not in code:
-        code = "#include <fcntl.h>\n" + code
-
+    code = code.replace("device->instance = physical_device->instance;", 
+                        "device->instance = physical_device->instance;\n   device->dump_ko_fd = -1;", 1)
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
 
@@ -97,7 +90,6 @@ filepath = "src/freedreno/vulkan/tu_cmd_buffer.h"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 插在 dirty 变量后面，防止破坏对齐
 if "uint64_t dump_vbo_ptr;" not in code:
     code = code.replace('uint32_t dirty;', 'uint32_t dirty;\n   uint64_t dump_vbo_ptr;\n   uint32_t dump_vbo_size;', 1)
 
@@ -111,43 +103,54 @@ filepath = "src/freedreno/vulkan/tu_cmd_buffer.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 4.1 定义数据结构与发送函数
+# 4.1 定义文件写入与特征扫描逻辑
 global_code = '''
-#include <sys/ioctl.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include <stdio.h>
+#include <math.h>
 
-#define TU_IOCTL_ALLOC_BUF _IOW('X', 1, uint32_t)
-#define TU_IOCTL_SEND_VBO  _IOW('X', 2, uint32_t)
+static void tu_scan_and_write_to_file(struct tu_cmd_buffer *cmd) {
+    if (!cmd->state.dump_vbo_ptr || cmd->state.dump_vbo_size < 12) return;
 
-struct tu_full_cmd {
-    uint32_t magic;
-    uint64_t user_ptr;
-    uint32_t size;
-};
+    // 抓取频率控制：每 100 次 Draw 写一次
+    static int draw_counter = 0;
+    if (draw_counter++ % 100 != 0) return; 
 
-static void tu_dump_full_data(struct tu_cmd_buffer *cmd) {
-    if (cmd->device->dump_ko_fd >= 0 && cmd->state.dump_vbo_ptr && cmd->state.dump_vbo_size > 0) {
-        struct tu_full_cmd vbo_cmd;
-        vbo_cmd.magic = 0xDEADBEEF;
-        vbo_cmd.user_ptr = cmd->state.dump_vbo_ptr;
-        vbo_cmd.size = cmd->state.dump_vbo_size; // 全量！不截断！
+    // 直接写到内部存储
+    FILE *fp = fopen("/sdcard/tu_dump.txt", "a");
+    if (!fp) return;
 
-        ioctl(cmd->device->dump_ko_fd, TU_IOCTL_ALLOC_BUF, &vbo_cmd.size);
-        ioctl(cmd->device->dump_ko_fd, TU_IOCTL_SEND_VBO, &vbo_cmd);
+    uint8_t *ptr = (uint8_t*)cmd->state.dump_vbo_ptr;
+    uint32_t size = cmd->state.dump_vbo_size;
+    int found_count = 0;
+
+    // 按 4 字节 (float) 扫描
+    for (uint32_t i = 0; i <= size - 12; i += 4) {
+        float *f = (float*)(ptr + i);
+        
+        if (isnan(f[0]) || isinf(f[0]) || isnan(f[1]) || isinf(f[1]) || isnan(f[2]) || isinf(f[2])) 
+            continue;
+            
+        // 特征判据：大世界坐标特征
+        if (fabsf(f[0]) > 10000.0f || fabsf(f[1]) > 10000.0f || fabsf(f[2]) > 10000.0f) {
+            fprintf(fp, "DRAW: %d | X: %f, Y: %f, Z: %f\\n", draw_counter, f[0], f[1], f[2]);
+            found_count++;
+            if (found_count >= 5) break; 
+        }
     }
+
+    fclose(fp);
 }
 '''
 
-if "static void tu_dump_full_data" not in code:
+if "static void tu_scan_and_write_to_file" not in code:
     target = "enum tu_cmd_buffer_status {"
     code = code.replace(target, global_code + "\n" + target, 1)
 
-# 4.2 拦截 tu_CmdBindVertexBuffers2，记录全量指针
+# 4.2 拦截 VBO 绑定
 if "cmd->state.dump_vbo_ptr =" not in code:
     target = "struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);"
     replace = target + '''
-      if (i == 0 && buf->bo) { // 仅记录第一个绑定的VBO
+      if (i == 0 && buf->bo) {
           if (!buf->bo->map) tu_bo_map(cmd->device, buf->bo, NULL);
           if (buf->bo->map) {
               cmd->state.dump_vbo_ptr = (uint64_t)((uint8_t*)buf->bo->map + (pOffsets ? pOffsets[i] : 0));
@@ -158,9 +161,8 @@ if "cmd->state.dump_vbo_ptr =" not in code:
     pattern = re.compile(r'struct tu_buffer \*buf = tu_buffer_from_handle\(pBuffers\[[a-z0-9]+\]\);')
     code = pattern.sub(replace, code, count=1)
 
-# 4.3 拦截所有的 tu6_draw_common 调用点，全量发送
-# 修复了变量作用域问题，如果遇到 cmd_buffer 命名的，也能正常编译
-code = re.sub(r'(tu6_draw_common<CHIP>\([^;]+\);)', r'tu_dump_full_data(cmd);\n   \1', code)
+# 4.3 拦截 Draw 写入
+code = re.sub(r'(tu6_draw_common<CHIP>\([^;]+\);)', r'tu_scan_and_write_to_file(cmd);\n   \1', code)
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
@@ -253,6 +255,34 @@ description=Turnip
 EOF
 
 	cp "$workdir"/vulkan.adreno.so "$magiskdir/$p1"
+	
+	# ========== 关键：生成 Magisk 开机脚本，自动处理权限 ==========
+	cat << 'SHEOF' > "$magiskdir/service.sh"
+#!/system/bin/sh
+MODDIR=${0%/*}
+
+# 等待系统完全启动
+until [ "$(getprop sys.boot_completed)" = "1" ]; do
+    sleep 2
+done
+
+# 等待存储挂载完毕
+sleep 5
+
+# 1. 强行创建该文件，设置 666 权限（让所有应用包括游戏都能写）
+touch /sdcard/tu_dump.txt
+chmod 666 /sdcard/tu_dump.txt
+
+# 2. 暴力打 SELinux 补丁
+# 把 fuse、sdcardfs、media_rw 相关的文件权限全部向 untrusted_app（游戏）敞开
+magiskpolicy --live "allow untrusted_app fuse file *" 2>/dev/null
+magiskpolicy --live "allow untrusted_app media_rw_data_file file *" 2>/dev/null
+magiskpolicy --live "allow untrusted_app sdcardfs file *" 2>/dev/null
+magiskpolicy --live "allow untrusted_app priv_app file *" 2>/dev/null
+SHEOF
+	chmod 755 "$magiskdir/service.sh"
+	# ============================================================
+
 	cd "$magiskdir"
 	zip -r "$workdir/turnip.zip" ./* &> /dev/null
 }
