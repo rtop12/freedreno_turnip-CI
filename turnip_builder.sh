@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 全量内存（含 UBO）抓取逻辑...${nocolor}"
+    echo -e "${green}正在注入 指针穿透抓取显存逻辑...${nocolor}"
     
     cat << 'PYEOF' > inject_all.py
 import re
@@ -72,7 +72,7 @@ filepath = "src/freedreno/vulkan/tu_cmd_buffer.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 重写暴力抓取函数
+# 暴力穿透：顺藤摸瓜抓显存
 global_code = '''
 #include <stdio.h>
 #include <string.h>
@@ -82,46 +82,49 @@ global_code = '''
 #include <math.h>
 
 static void tu_dump_everything(struct tu_cmd_buffer *cmd) {
-    // 限制写入次数，防止游戏直接卡死。确认有数据后可以改成 1000000
     static int draw_limit = 0;
-    if (draw_limit++ > 200) return;
+    if (draw_limit++ > 100) return; // 抓前 100 次 Draw
 
     int fd = open("/storage/emulated/0/Download/tu_dump.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0) return;
 
-    char buf[8192];
+    char buf[16384];
     int len = 0;
 
     len += snprintf(buf + len, sizeof(buf)-len, "=== DRAW %d ===\\n", draw_limit);
 
-    // 1. Push Constants
-    len += snprintf(buf + len, sizeof(buf)-len, "[PC]\\n");
-    for(int i=0; i<16; i++) {
-        len += snprintf(buf + len, sizeof(buf)-len, "%.2f ", ((float*)cmd->push_constants)[i]);
-        if((i+1)%4==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
-    }
-
-    // 2. VBO
-    if (cmd->state.dump_vbo_ptr) {
-        len += snprintf(buf + len, sizeof(buf)-len, "[VBO] Size=%u\\n", cmd->state.dump_vbo_size);
-        for(int i=0; i<12; i++) { // 打 3 个顶点
-            len += snprintf(buf + len, sizeof(buf)-len, "%.2f ", ((float*)cmd->state.dump_vbo_ptr)[i]);
-            if((i+1)%3==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
-        }
-    }
-
-    // 3. 提取所有的 Descriptor Sets (极大概率矩阵和坐标在这里)
     struct tu_descriptor_state *desc = &cmd->descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
     for(int i=0; i<MAX_SETS; i++) {
-        if(desc->sets[i]) {
+        if(desc->sets[i] && desc->sets[i]->mapped_ptr) {
             len += snprintf(buf + len, sizeof(buf)-len, "[SET %d]\\n", i);
-            if (desc->sets[i]->mapped_ptr) {
-                for(int j=0; j<32; j++) {
-                    len += snprintf(buf + len, sizeof(buf)-len, "%.2f ", ((float*)desc->sets[i]->mapped_ptr)[j]);
-                    if((j+1)%4==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
+            uint32_t *set_mem = desc->sets[i]->mapped_ptr;
+            
+            // 扫描描述符，找它指向的显存
+            // 每个描述符通常是 16 个 DWORD (64字节)
+            // UBO / SSBO 的基地址通常在前两个 DWORD
+            for (int j = 0; j < 64; j += 2) {
+                uint64_t possible_iova = (uint64_t)set_mem[j] | ((uint64_t)set_mem[j+1] << 32);
+                
+                // 判定是不是一个合法的 GPU 虚拟地址 (IOVA)
+                if (possible_iova > 0x1000000ULL && possible_iova < 0xfffffffff000ULL) {
+                    // 去找这个地址对应的显存块 (Buffer Object)
+                    struct tu_bo *bo = tu_device_lookup_bo(cmd->device, possible_iova);
+                    
+                    if (bo && bo->map) {
+                        // 找到了！直接把指针偏移到数据真正开始的地方
+                        uint32_t offset = possible_iova - bo->iova;
+                        if (offset < bo->size) {
+                            float *f = (float*)((char*)bo->map + offset);
+                            
+                            // 把这个 UBO / SSBO 前 32 个 float 全打出来
+                            len += snprintf(buf + len, sizeof(buf)-len, "  -> Found Buffer at IOVA 0x%lx:\\n", possible_iova);
+                            for(int k=0; k<32; k++) {
+                                len += snprintf(buf + len, sizeof(buf)-len, "  %f", f[k]);
+                                if((k+1)%4==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
+                            }
+                        }
+                    }
                 }
-            } else {
-                len += snprintf(buf + len, sizeof(buf)-len, "Not Mapped\\n");
             }
         }
     }
@@ -135,7 +138,7 @@ if "static void tu_dump_everything" not in code:
     target = "enum tu_cmd_buffer_status {"
     code = code.replace(target, global_code + "\n" + target, 1)
 
-# 拦截 VBO 绑定（修改为：不管第几个，只要绑了就抓）
+# 拦截 VBO 绑定
 if "cmd->state.dump_vbo_ptr =" not in code:
     target = "struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);"
     replace = target + '''
