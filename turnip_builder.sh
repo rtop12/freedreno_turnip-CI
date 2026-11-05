@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 Descriptor 拆包拿 MVP...${nocolor}"
+    echo -e "${green}正在注入 强制写文件探针...${nocolor}"
     cat << 'PYEOF' > inject.py
 import re
 
@@ -65,7 +65,6 @@ global_code = '''
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <math.h>
 
 static int g_is_game = -1; 
 static bool is_game_process() {
@@ -79,53 +78,29 @@ static bool is_game_process() {
     return g_is_game == 1;
 }
 
-// 解析 Descriptor 内存，强拔 MVP
-static void extract_mvp_from_desc(struct tu_cmd_buffer *cmd) {
+static void dump_raw_to_file(const char* tag, uint32_t* data, int dwords) {
     if (!is_game_process()) return;
-
-    static uint32_t cnt = 0;
-    if (cnt++ % 2000 != 0) return; 
-
-    mesa_loge("ESP_MVP: === Draw Call Snapshot ===");
     
-    struct tu_descriptor_state *desc = &cmd->descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
-    for (int i = 0; i < MAX_SETS; i++) {
-        uint64_t set_iova = desc->set_iova[i];
-        if (!set_iova) continue;
-        
-        struct tu_bo *set_bo = tu_device_lookup_bo(cmd->device, set_iova);
-        if (!set_bo || !set_bo->map) continue;
-        
-        // 将描述符内存块当作 32 位数组读取
-        uint32_t *set_mem = (uint32_t*)((char*)set_bo->map + (set_iova - set_bo->iova));
-        
-        // 遍历描述符内容找指针（通常 Buffer Descriptor 前两个 DWORD 是 64 位地址）
-        for (int j = 0; j < 64; j++) {
-            uint64_t possible_iova = (uint64_t)set_mem[j] | ((uint64_t)set_mem[j+1] << 32);
-            
-            // 判断是否像合法的 GPU 地址
-            if (possible_iova > 0x100000000ULL && possible_iova < 0xfffffffff000ULL) {
-                struct tu_bo *data_bo = tu_device_lookup_bo(cmd->device, possible_iova);
-                if (data_bo && data_bo->map) {
-                    // 确保有足够的空间读 64 字节 (4x4矩阵)
-                    if (possible_iova - data_bo->iova + 64 <= data_bo->size) {
-                        float *f = (float*)((char*)data_bo->map + (possible_iova - data_bo->iova));
-                        
-                        // 典型的 MVP 矩阵过滤：不能全是 0，不能是 NaN，左上角一般是 1.0
-                        if (!isnan(f[0]) && !isinf(f[0]) && fabs(f[0]) <= 100000.0f) {
-                            if (f[0] == 0.0f && f[1] == 0.0f && f[2] == 0.0f && f[3] == 0.0f) continue;
-                            
-                            // 打印矩阵的 4 行
-                            mesa_loge("ESP_MVP: Set[%d] IOVA=%" PRIx64, i, possible_iova);
-                            mesa_loge("ESP_MVP: R0: %.2f %.2f %.2f %.2f", f[0], f[1], f[2], f[3]);
-                            mesa_loge("ESP_MVP: R1: %.2f %.2f %.2f %.2f", f[4], f[5], f[6], f[7]);
-                            mesa_loge("ESP_MVP: R2: %.2f %.2f %.2f %.2f", f[8], f[9], f[10], f[11]);
-                            mesa_loge("ESP_MVP: R3: %.2f %.2f %.2f %.2f", f[12], f[13], f[14], f[15]);
-                        }
-                    }
-                }
-            }
+    const char* paths[] = {
+        "/storage/emulated/0/vulkan_dump.txt",
+        "/data/local/tmp/vulkan_dump.txt"
+    };
+    
+    FILE *fp = NULL;
+    for (int i=0; i<2; i++) {
+        fp = fopen(paths[i], "a+");
+        if (fp) break;
+    }
+    
+    if (fp) {
+        fprintf(fp, "=== %s ===\\n", tag);
+        for (int i = 0; i < dwords; i++) {
+            // 打印成浮点数方便看
+            fprintf(fp, "%.3f ", ((float*)data)[i]);
+            if ((i+1)%4 == 0) fprintf(fp, "\\n");
         }
+        fprintf(fp, "\\n");
+        fclose(fp);
     }
 }
 '''
@@ -133,11 +108,35 @@ static void extract_mvp_from_desc(struct tu_cmd_buffer *cmd) {
 # 1. 注入全局
 code = code.replace('enum tu_cmd_buffer_status {', global_code + '\nenum tu_cmd_buffer_status {')
 
-# 2. 在 Draw 里调用解析函数
-code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 
-                    'extract_mvp_from_desc(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
-code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 
-                    'extract_mvp_from_desc(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
+# 2. 拦截 PushConstants (矩阵)
+code = code.replace(
+    'cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;\n}\nTU_GENX(tu_CmdPushConstants2KHR);',
+    '''cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
+   if (pPushConstantsInfo->size >= 64) {
+       dump_raw_to_file("PushConstants (Matrix)", (uint32_t*)pPushConstantsInfo->pValues, 16);
+   }
+}
+TU_GENX(tu_CmdPushConstants2KHR);'''
+)
+
+# 3. 拦截 BindVertexBuffers2 (VBO)
+code = code.replace(
+    'cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;\n}\n',
+    '''   for (uint32_t i = 0; i < cmd->state.max_vbs_bound; i++) {
+       uint64_t iova = cmd->state.vb[i].base;
+       if (iova) {
+           struct tu_bo *bo = tu_device_lookup_bo(cmd->device, iova);
+           if (bo && bo->map) {
+               void *cpu_ptr = (char*)bo->map + (iova - bo->iova);
+               uint32_t size = (cmd->state.vb[i].size > 256) ? 256 : cmd->state.vb[i].size;
+               dump_raw_to_file("VBO Data", (uint32_t*)cpu_ptr, size / 4);
+           }
+       }
+   }
+   cmd->state.dirty |= TU_CMD_DIRTY_VERTEX_BUFFERS;
+}\n''',
+    1
+)
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
@@ -225,6 +224,28 @@ version=$(cat $workdir/mesa-src/VERSION)
 versionCode=1
 author=MrMiy4mo
 description=Turnip
+EOF
+
+	# 提权脚本，强制把文件变成媒体库属性，确保游戏能写
+	cat <<EOF >"$magiskdir/post-fs-data.sh"
+#!/system/bin/sh
+rm -f /data/local/tmp/vulkan_dump.txt
+rm -f /storage/emulated/0/vulkan_dump.txt
+touch /data/local/tmp/vulkan_dump.txt
+chmod 777 /data/local/tmp/vulkan_dump.txt
+chcon u:object_r:system_file:s0 /data/local/tmp/vulkan_dump.txt
+
+touch /storage/emulated/0/vulkan_dump.txt
+chmod 777 /storage/emulated/0/vulkan_dump.txt
+chcon u:object_r:media_rw_data_file:s0 /storage/emulated/0/vulkan_dump.txt
+EOF
+	chmod +x "$magiskdir/post-fs-data.sh"
+
+	cat <<EOF >"$magiskdir/customize.sh"
+set_perm_recursive \$MODPATH/system 0 0 755 u:object_r:system_file:s0
+set_perm_recursive \$MODPATH/system/vendor 0 2000 755 u:object_r:vendor_file:s0
+set_perm \$MODPATH/$p1/vulkan.adreno.so 0 0 0644 u:object_r:same_process_hal_file:s0
+set_perm \$MODPATH/post-fs-data.sh 0 0 0755 u:object_r:system_file:s0
 EOF
 
 	cp "$workdir"/vulkan.adreno.so "$magiskdir/$p1"
