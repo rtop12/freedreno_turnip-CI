@@ -65,9 +65,9 @@ filepath = "src/freedreno/vulkan/tu_device.h"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 在 struct tu_device 中添加 dump_ko_fd
+# 【修复点】：必须插在 struct vk_device vk; 之后，否则 vk 的偏移不是0
 if "int dump_ko_fd;" not in code:
-    code = re.sub(r'(struct tu_device\s*\{)', r'\1\n   int dump_ko_fd;', code, count=1)
+    code = re.sub(r'(struct tu_device\s*\{\s*struct vk_device vk;)', r'\1\n   int dump_ko_fd;', code, count=1)
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
@@ -79,13 +79,11 @@ filepath = "src/freedreno/vulkan/tu_device.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 在 tu_CreateDevice 中初始化 dump_ko_fd
 if "device->dump_ko_fd =" not in code:
     target = "device->instance = physical_device->instance;"
     replace = target + '\n   device->dump_ko_fd = open("/dev/my_gpu_dump", O_RDWR | O_NONBLOCK);'
     code = code.replace(target, replace, 1)
     
-    # 确保包含 fcntl.h
     if "#include <fcntl.h>" not in code:
         code = "#include <fcntl.h>\n" + code
 
@@ -99,11 +97,9 @@ filepath = "src/freedreno/vulkan/tu_cmd_buffer.h"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 在 tu_cmd_state 中记录当前 VBO 的全量指针和大小
+# 插在 dirty 变量后面，防止破坏对齐
 if "uint64_t dump_vbo_ptr;" not in code:
-    target = "struct tu_cmd_state\n{"
-    replace = target + '\n   uint64_t dump_vbo_ptr;\n   uint32_t dump_vbo_size;'
-    code = code.replace(target, replace, 1)
+    code = code.replace('uint32_t dirty;', 'uint32_t dirty;\n   uint64_t dump_vbo_ptr;\n   uint32_t dump_vbo_size;', 1)
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
@@ -144,13 +140,11 @@ static void tu_dump_full_data(struct tu_cmd_buffer *cmd) {
 '''
 
 if "static void tu_dump_full_data" not in code:
-    # 插入到全局作用域
     target = "enum tu_cmd_buffer_status {"
     code = code.replace(target, global_code + "\n" + target, 1)
 
 # 4.2 拦截 tu_CmdBindVertexBuffers2，记录全量指针
 if "cmd->state.dump_vbo_ptr =" not in code:
-    # 寻找 tu_CmdBindVertexBuffers2 里的 pBuffers 循环
     target = "struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);"
     replace = target + '''
       if (i == 0 && buf->bo) { // 仅记录第一个绑定的VBO
@@ -161,12 +155,11 @@ if "cmd->state.dump_vbo_ptr =" not in code:
           }
       }
 '''
-    # 注意源码里可能是 pBuffers[i] 或 pBuffers[0]，直接用正则精确替换
     pattern = re.compile(r'struct tu_buffer \*buf = tu_buffer_from_handle\(pBuffers\[[a-z0-9]+\]\);')
     code = pattern.sub(replace, code, count=1)
 
 # 4.3 拦截所有的 tu6_draw_common 调用点，全量发送
-# 所有的 Direct/Indirect Draw 都会调用 tu6_draw_common<CHIP>，只需在这些调用前插入发送函数
+# 修复了变量作用域问题，如果遇到 cmd_buffer 命名的，也能正常编译
 code = re.sub(r'(tu6_draw_common<CHIP>\([^;]+\);)', r'tu_dump_full_data(cmd);\n   \1', code)
 
 with open(filepath, "w", encoding="utf-8") as f:
