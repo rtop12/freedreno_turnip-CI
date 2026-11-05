@@ -52,106 +52,131 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 矩阵特征扫描器...${nocolor}"
-    cat << 'PYEOF' > inject.py
+    echo -e "${green}正在注入 全量 VBO 数据实时直传逻辑...${nocolor}"
+    
+    cat << 'PYEOF' > inject_all.py
 import re
+import os
 
+# ==========================================
+# 1. 修改 tu_device.h
+# ==========================================
+filepath = "src/freedreno/vulkan/tu_device.h"
+with open(filepath, "r", encoding="utf-8") as f:
+    code = f.read()
+
+# 在 struct tu_device 中添加 dump_ko_fd
+if "int dump_ko_fd;" not in code:
+    code = re.sub(r'(struct tu_device\s*\{)', r'\1\n   int dump_ko_fd;', code, count=1)
+
+with open(filepath, "w", encoding="utf-8") as f:
+    f.write(code)
+
+# ==========================================
+# 2. 修改 tu_device.cc
+# ==========================================
+filepath = "src/freedreno/vulkan/tu_device.cc"
+with open(filepath, "r", encoding="utf-8") as f:
+    code = f.read()
+
+# 在 tu_CreateDevice 中初始化 dump_ko_fd
+if "device->dump_ko_fd =" not in code:
+    target = "device->instance = physical_device->instance;"
+    replace = target + '\n   device->dump_ko_fd = open("/dev/my_gpu_dump", O_RDWR | O_NONBLOCK);'
+    code = code.replace(target, replace, 1)
+    
+    # 确保包含 fcntl.h
+    if "#include <fcntl.h>" not in code:
+        code = "#include <fcntl.h>\n" + code
+
+with open(filepath, "w", encoding="utf-8") as f:
+    f.write(code)
+
+# ==========================================
+# 3. 修改 tu_cmd_buffer.h
+# ==========================================
+filepath = "src/freedreno/vulkan/tu_cmd_buffer.h"
+with open(filepath, "r", encoding="utf-8") as f:
+    code = f.read()
+
+# 在 tu_cmd_state 中记录当前 VBO 的全量指针和大小
+if "uint64_t dump_vbo_ptr;" not in code:
+    target = "struct tu_cmd_state\n{"
+    replace = target + '\n   uint64_t dump_vbo_ptr;\n   uint32_t dump_vbo_size;'
+    code = code.replace(target, replace, 1)
+
+with open(filepath, "w", encoding="utf-8") as f:
+    f.write(code)
+
+# ==========================================
+# 4. 修改 tu_cmd_buffer.cc
+# ==========================================
 filepath = "src/freedreno/vulkan/tu_cmd_buffer.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
+# 4.1 定义数据结构与发送函数
 global_code = '''
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
-#include <math.h>
+#include <unistd.h>
 
-static int g_is_game = -1; 
-static bool is_game_process() {
-    if (g_is_game != -1) return g_is_game == 1;
-    char buf[256] = {0};
-    int fd = open("/proc/self/cmdline", O_RDONLY);
-    if (fd < 0) { g_is_game = 0; return false; }
-    read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    g_is_game = (strstr(buf, "com.tencent.tmgp.dfm") != NULL) ? 1 : 0;
-    return g_is_game == 1;
-}
+#define TU_IOCTL_ALLOC_BUF _IOW('X', 1, uint32_t)
+#define TU_IOCTL_SEND_VBO  _IOW('X', 2, uint32_t)
 
-// 判断数据是否像 MVP 矩阵 (4x4)
-static bool is_matrix(float *f) {
-    if (isnan(f[0]) || isinf(f[0])) return false;
-    // 矩阵的特征：通常包含 0.0, 1.0，且平移部分的坐标数值不会无限大
-    int zeros = 0, ones = 0;
-    for (int i = 0; i < 16; i++) {
-        if (fabs(f[i]) < 0.001f) zeros++;
-        if (fabs(f[i] - 1.0f) < 0.001f) ones++;
-    }
-    // 一个标准的 MVP 至少有 4 个 0 和 1 个 1
-    if (zeros >= 3 && ones >= 1) {
-        return true;
-    }
-    return false;
-}
+struct tu_full_cmd {
+    uint32_t magic;
+    uint64_t user_ptr;
+    uint32_t size;
+};
 
-static void find_mvp_in_memory(struct tu_cmd_buffer *cmd) {
-    if (!is_game_process()) return;
+static void tu_dump_full_data(struct tu_cmd_buffer *cmd) {
+    if (cmd->device->dump_ko_fd >= 0 && cmd->state.dump_vbo_ptr && cmd->state.dump_vbo_size > 0) {
+        struct tu_full_cmd vbo_cmd;
+        vbo_cmd.magic = 0xDEADBEEF;
+        vbo_cmd.user_ptr = cmd->state.dump_vbo_ptr;
+        vbo_cmd.size = cmd->state.dump_vbo_size; // 全量！不截断！
 
-    static uint32_t cnt = 0;
-    if (cnt++ % 100 != 0) return; // 每 100 次 Draw 扫一次，足够快了
-
-    struct tu_descriptor_state *desc = &cmd->descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
-    for (int i = 0; i < MAX_SETS; i++) {
-        uint64_t set_iova = desc->set_iova[i];
-        if (!set_iova) continue;
-        
-        struct tu_bo *set_bo = tu_device_lookup_bo(cmd->device, set_iova);
-        if (!set_bo || !set_bo->map) continue;
-        
-        uint32_t *set_mem = (uint32_t*)((char*)set_bo->map + (set_iova - set_bo->iova));
-        
-        // 扫整个描述符数组，找 IOVA 指针
-        for (int j = 0; j < 128; j += 2) { // 每次跳 2 个 DWORD
-            uint64_t possible_iova = (uint64_t)set_mem[j] | ((uint64_t)set_mem[j+1] << 32);
-            
-            if (possible_iova > 0x100000000ULL && possible_iova < 0xfffffffff000ULL) {
-                struct tu_bo *data_bo = tu_device_lookup_bo(cmd->device, possible_iova);
-                if (data_bo && data_bo->map) {
-                    if (possible_iova - data_bo->iova + 64 <= data_bo->size) {
-                        float *f = (float*)((char*)data_bo->map + (possible_iova - data_bo->iova));
-                        
-                        // 精准特征匹配
-                        if (is_matrix(f)) {
-                            mesa_loge("ESP_MVP: Found Matrix at Set[%d] IOVA=%" PRIx64, i, possible_iova);
-                            mesa_loge("ESP_MVP: R0: %f %f %f %f", f[0], f[1], f[2], f[3]);
-                            mesa_loge("ESP_MVP: R1: %f %f %f %f", f[4], f[5], f[6], f[7]);
-                            mesa_loge("ESP_MVP: R2: %f %f %f %f", f[8], f[9], f[10], f[11]);
-                            mesa_loge("ESP_MVP: R3: %f %f %f %f", f[12], f[13], f[14], f[15]);
-                        }
-                    }
-                }
-            }
-        }
+        ioctl(cmd->device->dump_ko_fd, TU_IOCTL_ALLOC_BUF, &vbo_cmd.size);
+        ioctl(cmd->device->dump_ko_fd, TU_IOCTL_SEND_VBO, &vbo_cmd);
     }
 }
 '''
 
-# 1. 注入全局
-code = code.replace('enum tu_cmd_buffer_status {', global_code + '\nenum tu_cmd_buffer_status {')
+if "static void tu_dump_full_data" not in code:
+    # 插入到全局作用域
+    target = "enum tu_cmd_buffer_status {"
+    code = code.replace(target, global_code + "\n" + target, 1)
 
-# 2. 在 Draw 里调用
-code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 
-                    'find_mvp_in_memory(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
-code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 
-                    'find_mvp_in_memory(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
+# 4.2 拦截 tu_CmdBindVertexBuffers2，记录全量指针
+if "cmd->state.dump_vbo_ptr =" not in code:
+    # 寻找 tu_CmdBindVertexBuffers2 里的 pBuffers 循环
+    target = "struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);"
+    replace = target + '''
+      if (i == 0 && buf->bo) { // 仅记录第一个绑定的VBO
+          if (!buf->bo->map) tu_bo_map(cmd->device, buf->bo, NULL);
+          if (buf->bo->map) {
+              cmd->state.dump_vbo_ptr = (uint64_t)((uint8_t*)buf->bo->map + (pOffsets ? pOffsets[i] : 0));
+              cmd->state.dump_vbo_size = pSizes ? pSizes[i] : buf->bo->size;
+          }
+      }
+'''
+    # 注意源码里可能是 pBuffers[i] 或 pBuffers[0]，直接用正则精确替换
+    pattern = re.compile(r'struct tu_buffer \*buf = tu_buffer_from_handle\(pBuffers\[[a-z0-9]+\]\);')
+    code = pattern.sub(replace, code, count=1)
+
+# 4.3 拦截所有的 tu6_draw_common 调用点，全量发送
+# 所有的 Direct/Indirect Draw 都会调用 tu6_draw_common<CHIP>，只需在这些调用前插入发送函数
+code = re.sub(r'(tu6_draw_common<CHIP>\([^;]+\);)', r'tu_dump_full_data(cmd);\n   \1', code)
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
+
+print("Injection completed successfully for all 4 files!")
 PYEOF
 
-    python3 inject.py
-    rm inject.py
+    python3 inject_all.py
+    rm inject_all.py
 }
 
 build_lib_for_android(){
