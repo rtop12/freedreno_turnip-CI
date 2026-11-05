@@ -52,80 +52,67 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 极暴力全量输出逻辑...${nocolor}"
+    echo -e "${green}正在注入 Download 目录全量输出逻辑...${nocolor}"
     
     cat << 'PYEOF' > inject_all.py
 import re
 import os
 
-# 1. tu_device.h
-filepath = "src/freedreno/vulkan/tu_device.h"
-with open(filepath, "r", encoding="utf-8") as f:
-    code = f.read()
-if "int dump_ko_fd;" not in code:
-    code = re.sub(r'(struct tu_device\s*\{\s*struct vk_device vk;)', r'\1\n   int dump_ko_fd;', code, count=1)
-with open(filepath, "w", encoding="utf-8") as f:
-    f.write(code)
+# 1. tu_cmd_buffer.h
+filepath_h = "src/freedreno/vulkan/tu_cmd_buffer.h"
+with open(filepath_h, "r", encoding="utf-8") as f:
+    code_h = f.read()
+if "uint64_t dump_vbo_ptr;" not in code_h:
+    code_h = code_h.replace('uint32_t dirty;', 'uint32_t dirty;\n   uint64_t dump_vbo_ptr;\n   uint32_t dump_vbo_size;', 1)
+with open(filepath_h, "w", encoding="utf-8") as f:
+    f.write(code_h)
 
-# 2. tu_device.cc
-filepath = "src/freedreno/vulkan/tu_device.cc"
-with open(filepath, "r", encoding="utf-8") as f:
-    code = f.read()
-if "device->dump_ko_fd =" not in code:
-    code = code.replace("device->instance = physical_device->instance;", 
-                        "device->instance = physical_device->instance;\n   device->dump_ko_fd = -1;", 1)
-with open(filepath, "w", encoding="utf-8") as f:
-    f.write(code)
-
-# 3. tu_cmd_buffer.h
-filepath = "src/freedreno/vulkan/tu_cmd_buffer.h"
-with open(filepath, "r", encoding="utf-8") as f:
-    code = f.read()
-if "uint64_t dump_vbo_ptr;" not in code:
-    code = code.replace('uint32_t dirty;', 'uint32_t dirty;\n   uint64_t dump_vbo_ptr;\n   uint32_t dump_vbo_size;', 1)
-with open(filepath, "w", encoding="utf-8") as f:
-    f.write(code)
-
-# 4. tu_cmd_buffer.cc
+# 2. tu_cmd_buffer.cc
 filepath = "src/freedreno/vulkan/tu_cmd_buffer.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 暴力写入函数：不加任何条件过滤
+# 暴力写入 Download 目录
 global_code = '''
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <math.h>
 
 static void tu_dump_everything(struct tu_cmd_buffer *cmd) {
-    // 不加频率限制，每次 Draw 都写
-    FILE *fp = fopen("/sdcard/tu_dump.txt", "a");
-    if (!fp) fp = fopen("/data/local/tmp/tu_dump.txt", "a"); // 兜底
-    if (!fp) return;
+    // 写到手机的下载目录，文件管理器绝对能看到
+    int fd = open("/storage/emulated/0/Download/tu_dump.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) return;
 
-    fprintf(fp, "=== NEW DRAW ===\\n");
+    char buf[4096];
+    int len = 0;
 
-    // 1. 暴力输出 PushConstants 所有的浮点数（看矩阵是不是在这里）
-    fprintf(fp, "[PushConstants]\\n");
-    for (int i = 0; i < 32; i++) { // 直接把 32 个都倒出来
-        fprintf(fp, "%f ", ((float*)cmd->push_constants)[i]);
-        if ((i+1)%4==0) fprintf(fp, "\\n");
+    len += snprintf(buf + len, sizeof(buf)-len, "=== DRAW ===\\n");
+
+    // 倒出 Push Constants（矩阵通常在这里）
+    len += snprintf(buf + len, sizeof(buf)-len, "[PC]\\n");
+    for(int i=0; i<16; i++) {
+        len += snprintf(buf + len, sizeof(buf)-len, "%.2f ", ((float*)cmd->push_constants)[i]);
+        if((i+1)%4==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
     }
 
-    // 2. 暴力输出 VBO 前 100 个 float
-    if (cmd->state.dump_vbo_ptr && cmd->state.dump_vbo_size >= 4) {
-        fprintf(fp, "[VBO] Ptr=%lx Size=%u\\n", cmd->state.dump_vbo_ptr, cmd->state.dump_vbo_size);
-        uint32_t limit = cmd->state.dump_vbo_size / 4;
-        if (limit > 100) limit = 100; // 输出前 100 个，足够看出格式了
-        for (uint32_t i = 0; i < limit; i++) {
-            fprintf(fp, "%f ", ((float*)cmd->state.dump_vbo_ptr)[i]);
-            if ((i+1)%4==0) fprintf(fp, "\\n");
+    // 倒出 VBO（顶点数据在这里）
+    if (cmd->state.dump_vbo_ptr) {
+        len += snprintf(buf + len, sizeof(buf)-len, "[VBO] Size=%u\\n", cmd->state.dump_vbo_size);
+        for(int i=0; i<16; i++) {
+            len += snprintf(buf + len, sizeof(buf)-len, "%.2f ", ((float*)cmd->state.dump_vbo_ptr)[i]);
+            if((i+1)%4==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
         }
-        fprintf(fp, "\\n");
     } else {
-        fprintf(fp, "[VBO] Not Found\\n");
+        len += snprintf(buf + len, sizeof(buf)-len, "[VBO] Not Mapped\\n");
     }
-    
-    fclose(fp);
+
+    if (len > 0) {
+        write(fd, buf, len);
+    }
+    close(fd);
 }
 '''
 
@@ -148,7 +135,7 @@ if "cmd->state.dump_vbo_ptr =" not in code:
     pattern = re.compile(r'struct tu_buffer \*buf = tu_buffer_from_handle\(pBuffers\[[a-z0-9]+\]\);')
     code = pattern.sub(replace, code, count=1)
 
-# 拦截 Draw 调用
+# 拦截 Draw
 code = re.sub(r'(tu6_draw_common<CHIP>\([^;]+\);)', r'tu_dump_everything(cmd);\n   \1', code)
 
 with open(filepath, "w", encoding="utf-8") as f:
@@ -242,29 +229,17 @@ EOF
 
 	cp "$workdir"/vulkan.adreno.so "$magiskdir/$p1"
 	
-	# 暴力破除权限限制
+	# 自动给 Download 目录下的文件赋权
 	cat << 'SHEOF' > "$magiskdir/service.sh"
 #!/system/bin/sh
 MODDIR=${0%/*}
-
-until [ "$(getprop sys.boot_completed)" = "1" ]; do
-    sleep 2
-done
+until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 2; done
 sleep 5
 
-# 创建文件
-touch /sdcard/tu_dump.txt
-chmod 666 /sdcard/tu_dump.txt
-chown media_rw:media_rw /sdcard/tu_dump.txt 2>/dev/null
-
-# SELinux 全量放行：让 untrusted_app（游戏进程）强行能写 fuse 和 sdcard
-magiskpolicy --live "allow untrusted_app fuse file *" 2>/dev/null
-magiskpolicy --live "allow untrusted_app sdcardfs file *" 2>/dev/null
-magiskpolicy --live "allow untrusted_app media_rw_data_file file *" 2>/dev/null
-magiskpolicy --live "allow untrusted_app shell_data_file file *" 2>/dev/null
-
-# 如果还有别的规则拦着，直接全局关闭 enforce（仅在模块内生效）
-# setenforce 0
+mkdir -p /storage/emulated/0/Download
+touch /storage/emulated/0/Download/tu_dump.txt
+chmod 777 /storage/emulated/0/Download/tu_dump.txt
+setenforce 0
 SHEOF
 	chmod 755 "$magiskdir/service.sh"
 
