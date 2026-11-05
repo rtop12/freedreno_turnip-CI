@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 全局内存池暴力抓取逻辑...${nocolor}"
+    echo -e "${green}正在注入 终极全量内存池扫描 (无长度限制版)...${nocolor}"
     
     cat << 'PYEOF' > inject_all.py
 import re
@@ -77,12 +77,11 @@ if "util_dynarray_init(&device->dump_buffers" not in code:
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
 
-# 3. tu_cmd_buffer.cc 核心拦截与暴力扫描
+# 3. tu_cmd_buffer.cc
 filepath = "src/freedreno/vulkan/tu_cmd_buffer.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 全局定义
 global_code = '''
 #include <stdio.h>
 #include <string.h>
@@ -96,20 +95,21 @@ struct dump_buffer_info {
     uint32_t size;
 };
 
-static void add_dump_buffer(struct tu_device *dev, struct tu_bo *bo) {
-    if (!bo || !bo->map) return;
+static void add_dump_buffer(struct tu_device *dev, void *map, uint32_t size) {
+    if (!map || size == 0) return;
     struct dump_buffer_info *bufs = (struct dump_buffer_info *)dev->dump_buffers.data;
     uint32_t count = dev->dump_buffers.size / sizeof(struct dump_buffer_info);
     for (uint32_t i = 0; i < count; i++) {
-        if (bufs[i].map == bo->map) return; // 已经记录过
+        if (bufs[i].map == map) return; // 已经记录过
     }
-    struct dump_buffer_info info = { .map = bo->map, .size = bo->size };
-    util_dynarray_append(&dev->dump_buffers, struct dump_buffer_info, info);
+    struct dump_buffer_info info = { .map = map, .size = size };
+    // 修复编译错误：只传两个参数
+    util_dynarray_append(&dev->dump_buffers, info);
 }
 
 static void tu_dump_everything(struct tu_cmd_buffer *cmd) {
     static int draw_limit = 0;
-    if (draw_limit++ > 100) return; // 抓前 100 次 Draw
+    if (draw_limit++ > 100) return;
 
     struct dump_buffer_info *bufs = (struct dump_buffer_info *)cmd->device->dump_buffers.data;
     uint32_t count = cmd->device->dump_buffers.size / sizeof(struct dump_buffer_info);
@@ -117,36 +117,36 @@ static void tu_dump_everything(struct tu_cmd_buffer *cmd) {
     int fd = open("/storage/emulated/0/Download/tu_dump.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0) return;
 
-    char buf[16384];
-    int len = 0;
-    len += snprintf(buf + len, sizeof(buf)-len, "=== DRAW %d ===\\n", draw_limit);
+    // 用 dprintf 直接写文件句柄，完全不受 buffer 长度限制
+    dprintf(fd, "=== DRAW %d ===\\n", draw_limit);
 
-    // 暴力扫描所有缓存的 BUFFER
     for (uint32_t i = 0; i < count; i++) {
         uint32_t num_floats = bufs[i].size / 4;
         float *f = (float *)bufs[i].map;
         int found = 0;
 
         for (uint32_t j = 0; j <= num_floats - 3; j++) {
-            // 过滤 NaN / Inf
             if (isnan(f[j]) || isinf(f[j]) || isnan(f[j+1]) || isinf(f[j+1]) || isnan(f[j+2]) || isinf(f[j+2])) 
                 continue;
 
-            // 判据：寻找 10000 到 10000000 之间的浮点数（大世界坐标）
+            // 寻找大世界坐标特征：数值在 10000 到 10000000 之间
             if (fabsf(f[j]) > 10000.0f && fabsf(f[j]) < 10000000.0f &&
                 fabsf(f[j+1]) > 10000.0f && fabsf(f[j+1]) < 10000000.0f) {
                 
                 if (found == 0) {
-                    len += snprintf(buf + len, sizeof(buf)-len, "[BUF %d] Size=%u\\n", i, bufs[i].size);
+                    dprintf(fd, "[BUF %d] Size=%u\\n", i, bufs[i].size);
                 }
-                len += snprintf(buf + len, sizeof(buf)-len, "  %f, %f, %f\\n", f[j], f[j+1], f[j+2]);
+                dprintf(fd, "  %f, %f, %f\\n", f[j], f[j+1], f[j+2]);
                 found++;
-                if (found >= 20) break; // 每个 BO 只输出前 20 个命中
+                // 限制单个 buffer 最多打印 100 个，防止把手机空间撑爆
+                if (found >= 100) { 
+                    dprintf(fd, "  ... (more hidden)\\n");
+                    break; 
+                }
             }
         }
     }
 
-    if (len > 0) write(fd, buf, len);
     close(fd);
 }
 '''
@@ -155,24 +155,24 @@ if "static void tu_dump_everything" not in code:
     target = "enum tu_cmd_buffer_status {"
     code = code.replace(target, global_code + "\n" + target, 1)
 
-# 拦截 VBO 绑定
-if "add_dump_buffer(cmd->device, buf->bo);" not in code:
+# 拦截 VBO
+if "add_dump_buffer(cmd->device, buf->bo->map, buf->bo->size);" not in code:
     target = "struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);"
     replace = target + '''
       if (buf && buf->bo) {
           if (!buf->bo->map) tu_bo_map(cmd->device, buf->bo, NULL);
-          add_dump_buffer(cmd->device, buf->bo);
+          add_dump_buffer(cmd->device, buf->bo->map, buf->bo->size);
       }
 '''
     pattern = re.compile(r'struct tu_buffer \*buf = tu_buffer_from_handle\(pBuffers\[[a-z0-9]+\]\);')
     code = pattern.sub(replace, code, count=1)
 
-# 拦截 Descriptor 绑定
-if "add_dump_buffer(cmd->device, set->bo);" not in code:
+# 拦截 Descriptor Set（修复之前的结构体报错）
+if "add_dump_buffer(cmd->device, set->mapped_ptr, set->size);" not in code:
     target = "VK_FROM_HANDLE(tu_descriptor_set, set, info->pDescriptorSets[i]);"
     replace = target + '''
-      if (set && set->bo) {
-          add_dump_buffer(cmd->device, set->bo);
+      if (set && set->mapped_ptr) {
+          add_dump_buffer(cmd->device, set->mapped_ptr, set->size);
       }
 '''
     code = code.replace(target, replace, 1)
