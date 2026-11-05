@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 Download 目录全量输出逻辑...${nocolor}"
+    echo -e "${green}正在注入 全量内存（含 UBO）抓取逻辑...${nocolor}"
     
     cat << 'PYEOF' > inject_all.py
 import re
@@ -72,7 +72,7 @@ filepath = "src/freedreno/vulkan/tu_cmd_buffer.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 暴力写入 Download 目录
+# 重写暴力抓取函数
 global_code = '''
 #include <stdio.h>
 #include <string.h>
@@ -82,36 +82,51 @@ global_code = '''
 #include <math.h>
 
 static void tu_dump_everything(struct tu_cmd_buffer *cmd) {
-    // 写到手机的下载目录，文件管理器绝对能看到
+    // 限制写入次数，防止游戏直接卡死。确认有数据后可以改成 1000000
+    static int draw_limit = 0;
+    if (draw_limit++ > 200) return;
+
     int fd = open("/storage/emulated/0/Download/tu_dump.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0) return;
 
-    char buf[4096];
+    char buf[8192];
     int len = 0;
 
-    len += snprintf(buf + len, sizeof(buf)-len, "=== DRAW ===\\n");
+    len += snprintf(buf + len, sizeof(buf)-len, "=== DRAW %d ===\\n", draw_limit);
 
-    // 倒出 Push Constants（矩阵通常在这里）
+    // 1. Push Constants
     len += snprintf(buf + len, sizeof(buf)-len, "[PC]\\n");
     for(int i=0; i<16; i++) {
         len += snprintf(buf + len, sizeof(buf)-len, "%.2f ", ((float*)cmd->push_constants)[i]);
         if((i+1)%4==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
     }
 
-    // 倒出 VBO（顶点数据在这里）
+    // 2. VBO
     if (cmd->state.dump_vbo_ptr) {
         len += snprintf(buf + len, sizeof(buf)-len, "[VBO] Size=%u\\n", cmd->state.dump_vbo_size);
-        for(int i=0; i<16; i++) {
+        for(int i=0; i<12; i++) { // 打 3 个顶点
             len += snprintf(buf + len, sizeof(buf)-len, "%.2f ", ((float*)cmd->state.dump_vbo_ptr)[i]);
-            if((i+1)%4==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
+            if((i+1)%3==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
         }
-    } else {
-        len += snprintf(buf + len, sizeof(buf)-len, "[VBO] Not Mapped\\n");
     }
 
-    if (len > 0) {
-        write(fd, buf, len);
+    // 3. 提取所有的 Descriptor Sets (极大概率矩阵和坐标在这里)
+    struct tu_descriptor_state *desc = &cmd->descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
+    for(int i=0; i<MAX_SETS; i++) {
+        if(desc->sets[i]) {
+            len += snprintf(buf + len, sizeof(buf)-len, "[SET %d]\\n", i);
+            if (desc->sets[i]->mapped_ptr) {
+                for(int j=0; j<32; j++) {
+                    len += snprintf(buf + len, sizeof(buf)-len, "%.2f ", ((float*)desc->sets[i]->mapped_ptr)[j]);
+                    if((j+1)%4==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
+                }
+            } else {
+                len += snprintf(buf + len, sizeof(buf)-len, "Not Mapped\\n");
+            }
+        }
     }
+
+    if (len > 0) write(fd, buf, len);
     close(fd);
 }
 '''
@@ -120,11 +135,11 @@ if "static void tu_dump_everything" not in code:
     target = "enum tu_cmd_buffer_status {"
     code = code.replace(target, global_code + "\n" + target, 1)
 
-# 拦截 VBO 绑定
+# 拦截 VBO 绑定（修改为：不管第几个，只要绑了就抓）
 if "cmd->state.dump_vbo_ptr =" not in code:
     target = "struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);"
     replace = target + '''
-      if (i == 0 && buf->bo) {
+      if (buf->bo) {
           if (!buf->bo->map) tu_bo_map(cmd->device, buf->bo, NULL);
           if (buf->bo->map) {
               cmd->state.dump_vbo_ptr = (uint64_t)((uint8_t*)buf->bo->map + (pOffsets ? pOffsets[i] : 0));
@@ -229,7 +244,6 @@ EOF
 
 	cp "$workdir"/vulkan.adreno.so "$magiskdir/$p1"
 	
-	# 自动给 Download 目录下的文件赋权
 	cat << 'SHEOF' > "$magiskdir/service.sh"
 #!/system/bin/sh
 MODDIR=${0%/*}
