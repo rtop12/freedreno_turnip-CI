@@ -52,28 +52,22 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 内部存储文件写入逻辑...${nocolor}"
+    echo -e "${green}正在注入 极暴力全量输出逻辑...${nocolor}"
     
     cat << 'PYEOF' > inject_all.py
 import re
 import os
 
-# ==========================================
-# 1. 修改 tu_device.h
-# ==========================================
+# 1. tu_device.h
 filepath = "src/freedreno/vulkan/tu_device.h"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
-
 if "int dump_ko_fd;" not in code:
     code = re.sub(r'(struct tu_device\s*\{\s*struct vk_device vk;)', r'\1\n   int dump_ko_fd;', code, count=1)
-
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
 
-# ==========================================
-# 2. 修改 tu_device.cc
-# ==========================================
+# 2. tu_device.cc
 filepath = "src/freedreno/vulkan/tu_device.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
@@ -83,70 +77,63 @@ if "device->dump_ko_fd =" not in code:
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
 
-# ==========================================
-# 3. 修改 tu_cmd_buffer.h
-# ==========================================
+# 3. tu_cmd_buffer.h
 filepath = "src/freedreno/vulkan/tu_cmd_buffer.h"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
-
 if "uint64_t dump_vbo_ptr;" not in code:
     code = code.replace('uint32_t dirty;', 'uint32_t dirty;\n   uint64_t dump_vbo_ptr;\n   uint32_t dump_vbo_size;', 1)
-
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
 
-# ==========================================
-# 4. 修改 tu_cmd_buffer.cc
-# ==========================================
+# 4. tu_cmd_buffer.cc
 filepath = "src/freedreno/vulkan/tu_cmd_buffer.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 4.1 定义文件写入与特征扫描逻辑
+# 暴力写入函数：不加任何条件过滤
 global_code = '''
 #include <stdio.h>
 #include <math.h>
 
-static void tu_scan_and_write_to_file(struct tu_cmd_buffer *cmd) {
-    if (!cmd->state.dump_vbo_ptr || cmd->state.dump_vbo_size < 12) return;
-
-    // 抓取频率控制：每 100 次 Draw 写一次
-    static int draw_counter = 0;
-    if (draw_counter++ % 100 != 0) return; 
-
-    // 直接写到内部存储
+static void tu_dump_everything(struct tu_cmd_buffer *cmd) {
+    // 不加频率限制，每次 Draw 都写
     FILE *fp = fopen("/sdcard/tu_dump.txt", "a");
+    if (!fp) fp = fopen("/data/local/tmp/tu_dump.txt", "a"); // 兜底
     if (!fp) return;
 
-    uint8_t *ptr = (uint8_t*)cmd->state.dump_vbo_ptr;
-    uint32_t size = cmd->state.dump_vbo_size;
-    int found_count = 0;
+    fprintf(fp, "=== NEW DRAW ===\\n");
 
-    // 按 4 字节 (float) 扫描
-    for (uint32_t i = 0; i <= size - 12; i += 4) {
-        float *f = (float*)(ptr + i);
-        
-        if (isnan(f[0]) || isinf(f[0]) || isnan(f[1]) || isinf(f[1]) || isnan(f[2]) || isinf(f[2])) 
-            continue;
-            
-        // 特征判据：大世界坐标特征
-        if (fabsf(f[0]) > 10000.0f || fabsf(f[1]) > 10000.0f || fabsf(f[2]) > 10000.0f) {
-            fprintf(fp, "DRAW: %d | X: %f, Y: %f, Z: %f\\n", draw_counter, f[0], f[1], f[2]);
-            found_count++;
-            if (found_count >= 5) break; 
-        }
+    // 1. 暴力输出 PushConstants 所有的浮点数（看矩阵是不是在这里）
+    fprintf(fp, "[PushConstants]\\n");
+    for (int i = 0; i < 32; i++) { // 直接把 32 个都倒出来
+        fprintf(fp, "%f ", ((float*)cmd->push_constants)[i]);
+        if ((i+1)%4==0) fprintf(fp, "\\n");
     }
 
+    // 2. 暴力输出 VBO 前 100 个 float
+    if (cmd->state.dump_vbo_ptr && cmd->state.dump_vbo_size >= 4) {
+        fprintf(fp, "[VBO] Ptr=%lx Size=%u\\n", cmd->state.dump_vbo_ptr, cmd->state.dump_vbo_size);
+        uint32_t limit = cmd->state.dump_vbo_size / 4;
+        if (limit > 100) limit = 100; // 输出前 100 个，足够看出格式了
+        for (uint32_t i = 0; i < limit; i++) {
+            fprintf(fp, "%f ", ((float*)cmd->state.dump_vbo_ptr)[i]);
+            if ((i+1)%4==0) fprintf(fp, "\\n");
+        }
+        fprintf(fp, "\\n");
+    } else {
+        fprintf(fp, "[VBO] Not Found\\n");
+    }
+    
     fclose(fp);
 }
 '''
 
-if "static void tu_scan_and_write_to_file" not in code:
+if "static void tu_dump_everything" not in code:
     target = "enum tu_cmd_buffer_status {"
     code = code.replace(target, global_code + "\n" + target, 1)
 
-# 4.2 拦截 VBO 绑定
+# 拦截 VBO 绑定
 if "cmd->state.dump_vbo_ptr =" not in code:
     target = "struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);"
     replace = target + '''
@@ -161,13 +148,12 @@ if "cmd->state.dump_vbo_ptr =" not in code:
     pattern = re.compile(r'struct tu_buffer \*buf = tu_buffer_from_handle\(pBuffers\[[a-z0-9]+\]\);')
     code = pattern.sub(replace, code, count=1)
 
-# 4.3 拦截 Draw 写入
-code = re.sub(r'(tu6_draw_common<CHIP>\([^;]+\);)', r'tu_scan_and_write_to_file(cmd);\n   \1', code)
+# 拦截 Draw 调用
+code = re.sub(r'(tu6_draw_common<CHIP>\([^;]+\);)', r'tu_dump_everything(cmd);\n   \1', code)
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
-
-print("Injection completed successfully for all 4 files!")
+print("Injection completed successfully!")
 PYEOF
 
     python3 inject_all.py
@@ -256,32 +242,31 @@ EOF
 
 	cp "$workdir"/vulkan.adreno.so "$magiskdir/$p1"
 	
-	# ========== 关键：生成 Magisk 开机脚本，自动处理权限 ==========
+	# 暴力破除权限限制
 	cat << 'SHEOF' > "$magiskdir/service.sh"
 #!/system/bin/sh
 MODDIR=${0%/*}
 
-# 等待系统完全启动
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
     sleep 2
 done
-
-# 等待存储挂载完毕
 sleep 5
 
-# 1. 强行创建该文件，设置 666 权限（让所有应用包括游戏都能写）
+# 创建文件
 touch /sdcard/tu_dump.txt
 chmod 666 /sdcard/tu_dump.txt
+chown media_rw:media_rw /sdcard/tu_dump.txt 2>/dev/null
 
-# 2. 暴力打 SELinux 补丁
-# 把 fuse、sdcardfs、media_rw 相关的文件权限全部向 untrusted_app（游戏）敞开
+# SELinux 全量放行：让 untrusted_app（游戏进程）强行能写 fuse 和 sdcard
 magiskpolicy --live "allow untrusted_app fuse file *" 2>/dev/null
-magiskpolicy --live "allow untrusted_app media_rw_data_file file *" 2>/dev/null
 magiskpolicy --live "allow untrusted_app sdcardfs file *" 2>/dev/null
-magiskpolicy --live "allow untrusted_app priv_app file *" 2>/dev/null
+magiskpolicy --live "allow untrusted_app media_rw_data_file file *" 2>/dev/null
+magiskpolicy --live "allow untrusted_app shell_data_file file *" 2>/dev/null
+
+# 如果还有别的规则拦着，直接全局关闭 enforce（仅在模块内生效）
+# setenforce 0
 SHEOF
 	chmod 755 "$magiskdir/service.sh"
-	# ============================================================
 
 	cd "$magiskdir"
 	zip -r "$workdir/turnip.zip" ./* &> /dev/null
