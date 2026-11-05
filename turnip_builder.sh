@@ -52,27 +52,37 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 指针穿透抓取显存逻辑...${nocolor}"
+    echo -e "${green}正在注入 全局内存池暴力抓取逻辑...${nocolor}"
     
     cat << 'PYEOF' > inject_all.py
 import re
 import os
 
-# 1. tu_cmd_buffer.h
-filepath_h = "src/freedreno/vulkan/tu_cmd_buffer.h"
-with open(filepath_h, "r", encoding="utf-8") as f:
-    code_h = f.read()
-if "uint64_t dump_vbo_ptr;" not in code_h:
-    code_h = code_h.replace('uint32_t dirty;', 'uint32_t dirty;\n   uint64_t dump_vbo_ptr;\n   uint32_t dump_vbo_size;', 1)
-with open(filepath_h, "w", encoding="utf-8") as f:
-    f.write(code_h)
+# 1. tu_device.h 添加全局记录池
+filepath = "src/freedreno/vulkan/tu_device.h"
+with open(filepath, "r", encoding="utf-8") as f:
+    code = f.read()
+if "util_dynarray dump_buffers;" not in code:
+    code = re.sub(r'(struct tu_device\s*\{\s*struct vk_device vk;)', r'\1\n   struct util_dynarray dump_buffers;', code, count=1)
+with open(filepath, "w", encoding="utf-8") as f:
+    f.write(code)
 
-# 2. tu_cmd_buffer.cc
+# 2. tu_device.cc 初始化内存池
+filepath = "src/freedreno/vulkan/tu_device.cc"
+with open(filepath, "r", encoding="utf-8") as f:
+    code = f.read()
+if "util_dynarray_init(&device->dump_buffers" not in code:
+    code = code.replace("device->instance = physical_device->instance;", 
+                        "device->instance = physical_device->instance;\n   util_dynarray_init(&device->dump_buffers, NULL);", 1)
+with open(filepath, "w", encoding="utf-8") as f:
+    f.write(code)
+
+# 3. tu_cmd_buffer.cc 核心拦截与暴力扫描
 filepath = "src/freedreno/vulkan/tu_cmd_buffer.cc"
 with open(filepath, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 暴力穿透：顺藤摸瓜抓显存
+# 全局定义
 global_code = '''
 #include <stdio.h>
 #include <string.h>
@@ -81,50 +91,57 @@ global_code = '''
 #include <errno.h>
 #include <math.h>
 
+struct dump_buffer_info {
+    void *map;
+    uint32_t size;
+};
+
+static void add_dump_buffer(struct tu_device *dev, struct tu_bo *bo) {
+    if (!bo || !bo->map) return;
+    struct dump_buffer_info *bufs = (struct dump_buffer_info *)dev->dump_buffers.data;
+    uint32_t count = dev->dump_buffers.size / sizeof(struct dump_buffer_info);
+    for (uint32_t i = 0; i < count; i++) {
+        if (bufs[i].map == bo->map) return; // 已经记录过
+    }
+    struct dump_buffer_info info = { .map = bo->map, .size = bo->size };
+    util_dynarray_append(&dev->dump_buffers, struct dump_buffer_info, info);
+}
+
 static void tu_dump_everything(struct tu_cmd_buffer *cmd) {
     static int draw_limit = 0;
     if (draw_limit++ > 100) return; // 抓前 100 次 Draw
+
+    struct dump_buffer_info *bufs = (struct dump_buffer_info *)cmd->device->dump_buffers.data;
+    uint32_t count = cmd->device->dump_buffers.size / sizeof(struct dump_buffer_info);
 
     int fd = open("/storage/emulated/0/Download/tu_dump.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0) return;
 
     char buf[16384];
     int len = 0;
-
     len += snprintf(buf + len, sizeof(buf)-len, "=== DRAW %d ===\\n", draw_limit);
 
-    struct tu_descriptor_state *desc = &cmd->descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
-    for(int i=0; i<MAX_SETS; i++) {
-        if(desc->sets[i] && desc->sets[i]->mapped_ptr) {
-            len += snprintf(buf + len, sizeof(buf)-len, "[SET %d]\\n", i);
-            uint32_t *set_mem = desc->sets[i]->mapped_ptr;
-            
-            // 扫描描述符，找它指向的显存
-            // 每个描述符通常是 16 个 DWORD (64字节)
-            // UBO / SSBO 的基地址通常在前两个 DWORD
-            for (int j = 0; j < 64; j += 2) {
-                uint64_t possible_iova = (uint64_t)set_mem[j] | ((uint64_t)set_mem[j+1] << 32);
+    // 暴力扫描所有缓存的 BUFFER
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t num_floats = bufs[i].size / 4;
+        float *f = (float *)bufs[i].map;
+        int found = 0;
+
+        for (uint32_t j = 0; j <= num_floats - 3; j++) {
+            // 过滤 NaN / Inf
+            if (isnan(f[j]) || isinf(f[j]) || isnan(f[j+1]) || isinf(f[j+1]) || isnan(f[j+2]) || isinf(f[j+2])) 
+                continue;
+
+            // 判据：寻找 10000 到 10000000 之间的浮点数（大世界坐标）
+            if (fabsf(f[j]) > 10000.0f && fabsf(f[j]) < 10000000.0f &&
+                fabsf(f[j+1]) > 10000.0f && fabsf(f[j+1]) < 10000000.0f) {
                 
-                // 判定是不是一个合法的 GPU 虚拟地址 (IOVA)
-                if (possible_iova > 0x1000000ULL && possible_iova < 0xfffffffff000ULL) {
-                    // 去找这个地址对应的显存块 (Buffer Object)
-                    struct tu_bo *bo = tu_device_lookup_bo(cmd->device, possible_iova);
-                    
-                    if (bo && bo->map) {
-                        // 找到了！直接把指针偏移到数据真正开始的地方
-                        uint32_t offset = possible_iova - bo->iova;
-                        if (offset < bo->size) {
-                            float *f = (float*)((char*)bo->map + offset);
-                            
-                            // 把这个 UBO / SSBO 前 32 个 float 全打出来
-                            len += snprintf(buf + len, sizeof(buf)-len, "  -> Found Buffer at IOVA 0x%lx:\\n", possible_iova);
-                            for(int k=0; k<32; k++) {
-                                len += snprintf(buf + len, sizeof(buf)-len, "  %f", f[k]);
-                                if((k+1)%4==0) len += snprintf(buf + len, sizeof(buf)-len, "\\n");
-                            }
-                        }
-                    }
+                if (found == 0) {
+                    len += snprintf(buf + len, sizeof(buf)-len, "[BUF %d] Size=%u\\n", i, bufs[i].size);
                 }
+                len += snprintf(buf + len, sizeof(buf)-len, "  %f, %f, %f\\n", f[j], f[j+1], f[j+2]);
+                found++;
+                if (found >= 20) break; // 每个 BO 只输出前 20 个命中
             }
         }
     }
@@ -139,19 +156,26 @@ if "static void tu_dump_everything" not in code:
     code = code.replace(target, global_code + "\n" + target, 1)
 
 # 拦截 VBO 绑定
-if "cmd->state.dump_vbo_ptr =" not in code:
+if "add_dump_buffer(cmd->device, buf->bo);" not in code:
     target = "struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);"
     replace = target + '''
-      if (buf->bo) {
+      if (buf && buf->bo) {
           if (!buf->bo->map) tu_bo_map(cmd->device, buf->bo, NULL);
-          if (buf->bo->map) {
-              cmd->state.dump_vbo_ptr = (uint64_t)((uint8_t*)buf->bo->map + (pOffsets ? pOffsets[i] : 0));
-              cmd->state.dump_vbo_size = pSizes ? pSizes[i] : buf->bo->size;
-          }
+          add_dump_buffer(cmd->device, buf->bo);
       }
 '''
     pattern = re.compile(r'struct tu_buffer \*buf = tu_buffer_from_handle\(pBuffers\[[a-z0-9]+\]\);')
     code = pattern.sub(replace, code, count=1)
+
+# 拦截 Descriptor 绑定
+if "add_dump_buffer(cmd->device, set->bo);" not in code:
+    target = "VK_FROM_HANDLE(tu_descriptor_set, set, info->pDescriptorSets[i]);"
+    replace = target + '''
+      if (set && set->bo) {
+          add_dump_buffer(cmd->device, set->bo);
+      }
+'''
+    code = code.replace(target, replace, 1)
 
 # 拦截 Draw
 code = re.sub(r'(tu6_draw_common<CHIP>\([^;]+\);)', r'tu_dump_everything(cmd);\n   \1', code)
