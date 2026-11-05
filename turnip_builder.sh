@@ -52,7 +52,7 @@ prepare_workdir(){
     mv "$MESA_DIR" mesa-src
     cd mesa-src
 
-    echo -e "${green}正在注入 严格进程过滤探针...${nocolor}"
+    echo -e "${green}正在注入 Descriptor 拆包拿 MVP...${nocolor}"
     cat << 'PYEOF' > inject.py
 import re
 
@@ -65,58 +65,66 @@ global_code = '''
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <math.h>
 
 static int g_is_game = -1; 
-static char g_proc_name[256] = {0};
-
 static bool is_game_process() {
     if (g_is_game != -1) return g_is_game == 1;
-    
+    char buf[256] = {0};
     int fd = open("/proc/self/cmdline", O_RDONLY);
     if (fd < 0) { g_is_game = 0; return false; }
-    int len = read(fd, g_proc_name, sizeof(g_proc_name) - 1);
+    read(fd, buf, sizeof(buf) - 1);
     close(fd);
-    if (len > 0) g_proc_name[len] = '\\0';
-    
-    // 只要包含这个包名（主进程或子进程）就放行
-    g_is_game = (strstr(g_proc_name, "com.tencent.tmgp.dfm") != NULL) ? 1 : 0;
-    
-    // 打印一次，看看是谁在用
-    if (g_is_game) {
-        mesa_loge("ESP_LOCK: Game Process Detected: [%s]", g_proc_name);
-    }
+    g_is_game = (strstr(buf, "com.tencent.tmgp.dfm") != NULL) ? 1 : 0;
     return g_is_game == 1;
 }
 
-// 强行拆包读取数据
-static void dump_state(struct tu_cmd_buffer *cmd) {
+// 解析 Descriptor 内存，强拔 MVP
+static void extract_mvp_from_desc(struct tu_cmd_buffer *cmd) {
     if (!is_game_process()) return;
 
-    // 极高阈值，保证不卡死
     static uint32_t cnt = 0;
-    if (cnt++ % 3000 != 0) return; 
+    if (cnt++ % 2000 != 0) return; 
 
-    mesa_loge("ESP_LOCK: Draw Snapshot in [%s]", g_proc_name);
+    mesa_loge("ESP_MVP: === Draw Call Snapshot ===");
     
-    // 1. 检查 VBO
-    if (cmd->state.vb[0].base) {
-        mesa_loge("ESP_LOCK: VBO IOVA: %" PRIx64, cmd->state.vb[0].base);
-    }
-    // 2. 检查 IBO
-    if (cmd->state.index_va) {
-        mesa_loge("ESP_LOCK: IBO IOVA: %" PRIx64, cmd->state.index_va);
-    }
-    // 3. 检查 DescBuffer (UE5 的新特性)
-    for (int i=0; i<8; i++) {
-        if (cmd->state.descriptor_buffer_iova[i]) {
-            mesa_loge("ESP_LOCK: DescBuf[%d] IOVA: %" PRIx64, i, cmd->state.descriptor_buffer_iova[i]);
-        }
-    }
-    // 4. 检查 DescSet
     struct tu_descriptor_state *desc = &cmd->descriptors[VK_PIPELINE_BIND_POINT_GRAPHICS];
-    for (int i=0; i<MAX_SETS; i++) {
-        if (desc->set_iova[i]) {
-            mesa_loge("ESP_LOCK: DescSet[%d] IOVA: %" PRIx64, i, desc->set_iova[i]);
+    for (int i = 0; i < MAX_SETS; i++) {
+        uint64_t set_iova = desc->set_iova[i];
+        if (!set_iova) continue;
+        
+        struct tu_bo *set_bo = tu_device_lookup_bo(cmd->device, set_iova);
+        if (!set_bo || !set_bo->map) continue;
+        
+        // 将描述符内存块当作 32 位数组读取
+        uint32_t *set_mem = (uint32_t*)((char*)set_bo->map + (set_iova - set_bo->iova));
+        
+        // 遍历描述符内容找指针（通常 Buffer Descriptor 前两个 DWORD 是 64 位地址）
+        for (int j = 0; j < 64; j++) {
+            uint64_t possible_iova = (uint64_t)set_mem[j] | ((uint64_t)set_mem[j+1] << 32);
+            
+            // 判断是否像合法的 GPU 地址
+            if (possible_iova > 0x100000000ULL && possible_iova < 0xfffffffff000ULL) {
+                struct tu_bo *data_bo = tu_device_lookup_bo(cmd->device, possible_iova);
+                if (data_bo && data_bo->map) {
+                    // 确保有足够的空间读 64 字节 (4x4矩阵)
+                    if (possible_iova - data_bo->iova + 64 <= data_bo->size) {
+                        float *f = (float*)((char*)data_bo->map + (possible_iova - data_bo->iova));
+                        
+                        // 典型的 MVP 矩阵过滤：不能全是 0，不能是 NaN，左上角一般是 1.0
+                        if (!isnan(f[0]) && !isinf(f[0]) && fabs(f[0]) <= 100000.0f) {
+                            if (f[0] == 0.0f && f[1] == 0.0f && f[2] == 0.0f && f[3] == 0.0f) continue;
+                            
+                            // 打印矩阵的 4 行
+                            mesa_loge("ESP_MVP: Set[%d] IOVA=%" PRIx64, i, possible_iova);
+                            mesa_loge("ESP_MVP: R0: %.2f %.2f %.2f %.2f", f[0], f[1], f[2], f[3]);
+                            mesa_loge("ESP_MVP: R1: %.2f %.2f %.2f %.2f", f[4], f[5], f[6], f[7]);
+                            mesa_loge("ESP_MVP: R2: %.2f %.2f %.2f %.2f", f[8], f[9], f[10], f[11]);
+                            mesa_loge("ESP_MVP: R3: %.2f %.2f %.2f %.2f", f[12], f[13], f[14], f[15]);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -125,11 +133,11 @@ static void dump_state(struct tu_cmd_buffer *cmd) {
 # 1. 注入全局
 code = code.replace('enum tu_cmd_buffer_status {', global_code + '\nenum tu_cmd_buffer_status {')
 
-# 2. 在 Draw 里调用
+# 2. 在 Draw 里调用解析函数
 code = code.replace('tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);', 
-                    'dump_state(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
+                    'extract_mvp_from_desc(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);')
 code = code.replace('tu6_draw_common<CHIP>(cmd, cs, true, indexCount);', 
-                    'dump_state(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
+                    'extract_mvp_from_desc(cmd);\n   tu6_draw_common<CHIP>(cmd, cs, true, indexCount);')
 
 with open(filepath, "w", encoding="utf-8") as f:
     f.write(code)
@@ -139,7 +147,6 @@ PYEOF
     rm inject.py
 }
 
-# 后面编译和打包代码保持不变...
 build_lib_for_android(){
 	mkdir -p "$workdir/bin"
 	ln -sf "$ndk/clang" "$workdir/bin/cc"
